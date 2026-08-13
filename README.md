@@ -78,6 +78,20 @@ com.apple.mobile.MobileHouseArrest
 
 Changing it disables the MobileHouseArrest path.
 
+## Mixed traversal map
+
+`[MHA-Mixed EXP] Experimental` contains only the probes that succeeded during
+the previous iPadOS 27.0 (`24A5390f`) device run. The retained probe numbers
+remain unchanged so new `Probe Results.plist` output can be compared directly
+with that run.
+
+Each successful link requires a non-empty token from that query, successful
+activation, an exact canonical-path match, and a read-only directory open.
+`README.txt`, `README - Access.txt`, `Access Map.txt`, and
+`Probe Results.plist` report successes, failures, activation evidence, and
+errno values. Probe setup does not modify target files, and the custom Filza
+copy, paste, and delete paths stay disabled inside the Mixed folder.
+
 ## iOS 26 app discovery
 
 iOS 26 can hide third-party apps from the normal ContainerManager and
@@ -90,6 +104,61 @@ catalog.
 `MCMIdentifiers.plist` remains an optional manual fallback. You can generate
 one with `scripts/refresh_device_catalog.sh` and pass it as the third release
 build argument.
+
+## App Manager RSD cache
+
+App Manager can refresh names, versions, bundle identifiers, and icons through
+the local device-service transports used by JIT/debugging tools. This does not
+scan application bundle directories.
+
+1. Put the device pairing file in Filza's `Documents` root, next to `Device
+   Storage`. Use `pairingFile.plist`, `rp_pairing_file.plist`, or a file ending
+   in `.mobiledevicepairing`/`.mobiledevicepair`. Other Documents-root `.plist`
+   names are also tried and accepted only if either the RemotePairing or
+   traditional Lockdown parser validates them.
+2. Start LocalDevVPN.
+3. Launch Filza. The refresh starts in the background immediately, is retried
+   when App Manager opens or Filza becomes active, and repeats every five
+   minutes while Filza remains in the foreground. It connects to
+   `10.7.0.1:49152`, reads `installation_proxy`, commits changed metadata, then
+   downloads only missing or version-stale icons from SpringBoardServices.
+4. Keep LocalDevVPN active until either `App Manager RSD Diagnostics.txt` next
+   to `Device Storage`, or the copy inside `Device Storage`, reports `complete`.
+
+A local-network privacy prompt is not expected for every configuration. A raw
+unicast connection routed through the VPN interface can proceed without that
+prompt, so use the staged diagnostics file rather than the presence of a popup
+as the connection indicator.
+
+Two pairing formats are supported and selected by actual parsing:
+
+- RemotePairing records containing `public_key`, `private_key`, and
+  `identifier` use RPPairing/RSD on `10.7.0.1:49152`.
+- Traditional Lockdown records containing `HostCertificate`,
+  `HostPrivateKey`, `RootCertificate`, and `HostID` use the Lockdown TCP
+  provider on `10.7.0.1:62078`.
+
+These formats use different cryptographic identities and are not converted
+into one another. The diagnostics file records the selected transport.
+
+The persistent result is stored under `Documents/App Manager Cache`. Later App
+Manager launches use that cache without needing the VPN. A failed refresh does
+not replace an existing successful cache. If the application records are
+unchanged, the existing `Applications.plist` and icon cache are preserved. If
+an install or uninstall changes the records, the RSD list becomes the App
+Manager catalogue and the visible list is rebuilt.
+
+App Manager search filters that catalogue directly by localized application
+name or complete bundle identifier; it does not invoke Filza's filesystem
+search. For RSD user applications missing from the launch-time class-2 map,
+Filza retries the class-2 lookup in the background and adds the data-container
+link when MobileContainerManager grants it. System records without an
+independent class-2 data container remain visible for inventory purposes but
+cannot be opened as application data.
+
+The current implementation intentionally uses external LocalDevVPN. Embedding
+a VPN requires a separately provisioned Packet Tunnel Provider extension; a
+VPN entitlement on the main app alone is not sufficient.
 
 ## Build
 

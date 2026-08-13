@@ -49,6 +49,11 @@ if codesign -d "$APP" >/dev/null 2>&1; then
   exit 65
 fi
 
+LOCAL_NETWORK_REASON="Filza uses LocalDevVPN briefly to refresh App Manager names and icons from this device."
+if ! plutil -replace NSLocalNetworkUsageDescription -string "$LOCAL_NETWORK_REASON" "$APP/Info.plist" 2>/dev/null; then
+  plutil -insert NSLocalNetworkUsageDescription -string "$LOCAL_NETWORK_REASON" "$APP/Info.plist"
+fi
+
 cp "$DYLIB" "$APP/Frameworks/FilzaApplySandboxExt.dylib"
 codesign --remove-signature "$APP/Frameworks/FilzaApplySandboxExt.dylib"
 

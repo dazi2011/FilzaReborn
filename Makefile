@@ -1,13 +1,13 @@
 # Use the newest SDK bundled with this Theos installation.  ContainerManager
 # entry points are resolved at runtime, so private SDK headers are not needed.
-TARGET := iphone:clang:17.5:15.0
-ARCHS = arm64 arm64e
+TARGET := iphone:clang:latest:17.0
+ARCHS = arm64
 
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = FilzaApplySandboxExt
 
-FilzaApplySandboxExt_FILES = Tweak.m MCMBridge.m MCMFilzaIntegration.m PosterBoardFeature.m
+FilzaApplySandboxExt_FILES = Tweak.m MCMBridge.m MCMFilzaIntegration.m MHADeviceCatalog.m PosterBoardFeature.m
 
 # The original jailed Filza kernel path is used only by the exact iOS 18.5
 # target gate in Tweak.m. Newer systems continue to use the MCM path.
@@ -30,9 +30,10 @@ FilzaApplySandboxExt_CCFLAGS = $(FilzaApplySandboxExt_CFLAGS)
 FilzaApplySandboxExt_OBJCFLAGS = $(FilzaApplySandboxExt_CFLAGS)
 FilzaApplySandboxExt_OBJCCFLAGS = $(FilzaApplySandboxExt_CFLAGS)
 
-FilzaApplySandboxExt_FRAMEWORKS = UIKit Foundation IOKit CoreFoundation
+FilzaApplySandboxExt_FRAMEWORKS = UIKit Foundation IOKit CoreFoundation Security SystemConfiguration
 FilzaApplySandboxExt_PRIVATE_FRAMEWORKS = IOSurface
-FilzaApplySandboxExt_LIBRARIES = z sandbox
+FilzaApplySandboxExt_LIBRARIES = z sandbox c++
+FilzaApplySandboxExt_LDFLAGS += $(PWD)/vendor/idevice/libidevice_ffi.a
 
 FilzaApplySandboxExt_INSTALL_TARGET_PROCESSES = Filza
 

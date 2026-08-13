@@ -8,6 +8,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, copy, readonly) NSString *rootPath;
 @property(nonatomic, readonly) BOOL groupIdentifier;
 @property(nonatomic, readonly) BOOL tokenPresent;
+@property(nonatomic, readonly) NSUInteger tokenLength;
 @property(nonatomic, readonly) BOOL activated;
 
 + (nullable instancetype)leaseForClass:(uint64_t)containerClass

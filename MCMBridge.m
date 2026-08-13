@@ -2,6 +2,7 @@
 
 #import <dlfcn.h>
 #import <stdlib.h>
+#import <string.h>
 #import <xpc/xpc.h>
 
 typedef void *(*MCMQueryCreate)(void);
@@ -136,6 +137,7 @@ BOOL MCMBridgeAvailable(void)
 @property(nonatomic, copy, readwrite) NSString *rootPath;
 @property(nonatomic, readwrite) BOOL groupIdentifier;
 @property(nonatomic, readwrite) BOOL tokenPresent;
+@property(nonatomic, readwrite) NSUInteger tokenLength;
 @property(nonatomic, readwrite) BOOL activated;
 @end
 
@@ -232,7 +234,8 @@ BOOL MCMBridgeAvailable(void)
     void *object = api->queryGetSingle(_query);
     _activation = object ? api->objectCopy(object) : NULL;
     char *token = _activation ? api->objectCopyToken(_activation) : NULL;
-    self.tokenPresent = token && token[0] != '\0';
+    self.tokenLength = token ? strlen(token) : 0;
+    self.tokenPresent = self.tokenLength != 0;
     free(token);
     self.activated = self.tokenPresent && api->objectActivate(_activation, false);
     if (!self.activated && error)

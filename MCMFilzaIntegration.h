@@ -5,6 +5,10 @@ NS_ASSUME_NONNULL_BEGIN
 FOUNDATION_EXPORT void MCMFilzaStart(void);
 FOUNDATION_EXPORT NSString *_Nullable MCMFilzaDataContainerPath(
     NSString *identifier, NSString * _Nullable * _Nullable error);
+FOUNDATION_EXPORT BOOL MCMFilzaEnsureAppDataLink(
+    NSString *identifier, NSString * _Nullable * _Nullable error);
+FOUNDATION_EXPORT NSArray<NSString *> *MCMFilzaAppDataIdentifiers(void);
+FOUNDATION_EXPORT NSString *_Nullable MCMFilzaAppDataPath(NSString *identifier);
 FOUNDATION_EXPORT NSString *MCMFilzaVirtualRoot(void);
 FOUNDATION_EXPORT NSString *MCMFilzaWallpaperLabName(void);
 FOUNDATION_EXPORT BOOL MCMFilzaPathHasActiveLease(NSString *path);
