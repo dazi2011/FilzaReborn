@@ -165,164 +165,663 @@ static void hook_sendObjectWithReplyAsync(id self, SEL _cmd, id msg, id queue, i
     if (completion) { void (^block)(id) = completion; block(nil); }
 }
 
-#pragma mark - Zip/Unzip via minizip C API (linked in Filza binary)
+#pragma mark - In-process ZIP support
 
-// minizip C functions — statically linked in Filza, resolve via dlsym at runtime
-#include <dlfcn.h>
-typedef void* zipFile64;
-typedef void* unzFile64;
+// The SDK ships libarchive as a public dylib but does not ship its headers.
+// Keep the small ABI surface used here local instead of depending on a host
+// package-manager header path.
+struct archive;
+struct archive_entry;
+typedef int64_t filza_la_int64_t;
+typedef ssize_t filza_la_ssize_t;
 
-// Function pointer types
-static zipFile64 (*p_zipOpen64)(const char*, int);
-static int (*p_zipOpenNewFileInZip64)(zipFile64, const char*, const void*, const void*, unsigned, const void*, unsigned, const char*, int, int, int);
-static int (*p_zipWriteInFileInZip)(zipFile64, const void*, unsigned);
-static int (*p_zipCloseFileInZip)(zipFile64);
-static int (*p_zipClose)(zipFile64, const char*);
-static unzFile64 (*p_unzOpen64)(const char*);
-static int (*p_unzGoToFirstFile)(unzFile64);
-static int (*p_unzGoToNextFile)(unzFile64);
-static int (*p_unzGetCurrentFileInfo64)(unzFile64, void*, char*, unsigned long, void*, unsigned long, char*, unsigned long);
-static int (*p_unzOpenCurrentFilePassword)(unzFile64, const char*);
-static int (*p_unzReadCurrentFile)(unzFile64, void*, unsigned);
-static int (*p_unzCloseCurrentFile)(unzFile64);
-static int (*p_unzClose)(unzFile64);
+extern struct archive *archive_read_new(void);
+extern int archive_read_support_filter_all(struct archive *);
+extern int archive_read_support_format_zip(struct archive *);
+extern int archive_read_add_passphrase(struct archive *, const char *);
+extern int archive_read_open_filename(struct archive *, const char *, size_t);
+extern int archive_read_next_header(struct archive *, struct archive_entry **);
+extern filza_la_ssize_t archive_read_data(struct archive *, void *, size_t);
+extern int archive_read_data_block(struct archive *, const void **, size_t *,
+    filza_la_int64_t *);
+extern int archive_read_data_skip(struct archive *);
+extern int archive_read_close(struct archive *);
+extern int archive_read_free(struct archive *);
 
-static bool g_minizipLoaded = false;
-static void loadMinizip(void) {
-    if (g_minizipLoaded) return;
-    // RTLD_DEFAULT searches all loaded images including Filza's statically linked minizip
-    p_zipOpen64 = dlsym(RTLD_DEFAULT, "zipOpen64");
-    p_zipOpenNewFileInZip64 = dlsym(RTLD_DEFAULT, "zipOpenNewFileInZip64");
-    p_zipWriteInFileInZip = dlsym(RTLD_DEFAULT, "zipWriteInFileInZip");
-    p_zipCloseFileInZip = dlsym(RTLD_DEFAULT, "zipCloseFileInZip");
-    p_zipClose = dlsym(RTLD_DEFAULT, "zipClose");
-    p_unzOpen64 = dlsym(RTLD_DEFAULT, "unzOpen64");
-    p_unzGoToFirstFile = dlsym(RTLD_DEFAULT, "unzGoToFirstFile");
-    p_unzGoToNextFile = dlsym(RTLD_DEFAULT, "unzGoToNextFile");
-    p_unzGetCurrentFileInfo64 = dlsym(RTLD_DEFAULT, "unzGetCurrentFileInfo64");
-    p_unzOpenCurrentFilePassword = dlsym(RTLD_DEFAULT, "unzOpenCurrentFilePassword");
-    p_unzReadCurrentFile = dlsym(RTLD_DEFAULT, "unzReadCurrentFile");
-    p_unzCloseCurrentFile = dlsym(RTLD_DEFAULT, "unzCloseCurrentFile");
-    p_unzClose = dlsym(RTLD_DEFAULT, "unzClose");
-    g_minizipLoaded = (p_zipOpen64 && p_unzOpen64);
-    NSLog(@"[Tweak] minizip loaded: %d (zip=%p unz=%p)", g_minizipLoaded, p_zipOpen64, p_unzOpen64);
+extern struct archive *archive_write_new(void);
+extern int archive_write_add_filter_none(struct archive *);
+extern int archive_write_set_format_zip(struct archive *);
+extern int archive_write_open_filename(struct archive *, const char *);
+extern int archive_write_header(struct archive *, struct archive_entry *);
+extern filza_la_ssize_t archive_write_data(struct archive *, const void *,
+    size_t);
+extern filza_la_ssize_t archive_write_data_block(struct archive *, const void *,
+    size_t, filza_la_int64_t);
+extern int archive_write_finish_entry(struct archive *);
+extern int archive_write_close(struct archive *);
+extern int archive_write_free(struct archive *);
+extern struct archive *archive_write_disk_new(void);
+extern int archive_write_disk_set_options(struct archive *, int);
+extern int archive_write_disk_set_standard_lookup(struct archive *);
+extern const char *archive_error_string(struct archive *);
+
+extern struct archive_entry *archive_entry_new(void);
+extern void archive_entry_free(struct archive_entry *);
+extern const char *archive_entry_pathname(struct archive_entry *);
+extern const char *archive_entry_pathname_utf8(struct archive_entry *);
+extern const char *archive_entry_hardlink_utf8(struct archive_entry *);
+extern const char *archive_entry_symlink_utf8(struct archive_entry *);
+extern mode_t archive_entry_filetype(struct archive_entry *);
+extern void archive_entry_set_pathname_utf8(struct archive_entry *,
+    const char *);
+extern void archive_entry_set_filetype(struct archive_entry *, unsigned int);
+extern void archive_entry_set_perm(struct archive_entry *, mode_t);
+extern void archive_entry_set_size(struct archive_entry *, filza_la_int64_t);
+extern void archive_entry_set_mtime(struct archive_entry *, time_t, long);
+extern void archive_entry_set_symlink_utf8(struct archive_entry *,
+    const char *);
+
+enum {
+    FILZA_ARCHIVE_EOF = 1,
+    FILZA_ARCHIVE_OK = 0,
+    FILZA_ARCHIVE_WARN = -20,
+    FILZA_ARCHIVE_EXTRACT_PERM = 0x0002,
+    FILZA_ARCHIVE_EXTRACT_TIME = 0x0004,
+    FILZA_ARCHIVE_EXTRACT_SECURE_SYMLINKS = 0x0100,
+    FILZA_ARCHIVE_EXTRACT_SECURE_NODOTDOT = 0x0200,
+    FILZA_ARCHIVE_EXTRACT_SAFE_WRITES = 0x40000,
+};
+
+static IMP orig_ZipFiles = NULL;
+static IMP orig_unZipFile = NULL;
+static IMP orig_unZipFilePassword = NULL;
+static IMP orig_dataInZipFilePath = NULL;
+static IMP orig_dataInZipFile = NULL;
+
+static NSString *filzaArchiveObjectPath(id object) {
+    if ([object isKindOfClass:NSString.class]) return object;
+    if ([object isKindOfClass:NSURL.class]) return [object path];
+    for (NSString *name in @[@"filePath", @"path"]) {
+        SEL selector = NSSelectorFromString(name);
+        if ([object respondsToSelector:selector]) {
+            id value = ((id(*)(id, SEL))objc_msgSend)(object, selector);
+            if ([value isKindOfClass:NSString.class]) return value;
+            if ([value isKindOfClass:NSURL.class]) return [value path];
+        }
+    }
+    return nil;
 }
 
-static IMP orig_ZipFiles = NULL, orig_unZipFile = NULL, orig_unZipFilePassword = NULL;
-
-// Recursively add files to a zip archive using minizip C API
-static void addFileToZip(zipFile64 zf, NSString *basePath, NSString *relativePath) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *fullPath = [basePath stringByAppendingPathComponent:relativePath];
-    BOOL isDir = NO;
-    [fm fileExistsAtPath:fullPath isDirectory:&isDir];
-    if (isDir) {
-        // Add directory entry
-        NSString *dirEntry = [relativePath stringByAppendingString:@"/"];
-        p_zipOpenNewFileInZip64(zf, dirEntry.UTF8String, NULL, NULL, 0, NULL, 0, NULL, 0, 0, 0);
-        p_zipCloseFileInZip(zf);
-        for (NSString *item in [fm contentsOfDirectoryAtPath:fullPath error:nil])
-            addFileToZip(zf, basePath, [relativePath stringByAppendingPathComponent:item]);
-    } else {
-        NSData *data = [NSData dataWithContentsOfFile:fullPath];
-        if (!data) return;
-        // Z_DEFLATED=8, Z_DEFAULT_COMPRESSION=-1
-        p_zipOpenNewFileInZip64(zf, relativePath.UTF8String, NULL, NULL, 0, NULL, 0, NULL, 8, -1, data.length > 0xFFFFFFFF);
-        p_zipWriteInFileInZip(zf, data.bytes, (unsigned int)data.length);
-        p_zipCloseFileInZip(zf);
+static NSString *filzaArchiveResolvedPath(id object, id baseObject) {
+    NSString *path = filzaArchiveObjectPath(object);
+    if (path.length == 0) return nil;
+    if (!path.isAbsolutePath) {
+        NSString *base = filzaArchiveObjectPath(baseObject);
+        if (base.length > 0)
+            path = [base stringByAppendingPathComponent:path];
     }
+    return path.stringByStandardizingPath;
+}
+
+static NSString *filzaArchiveError(struct archive *archive,
+                                   NSString *fallback) {
+    const char *message = archive ? archive_error_string(archive) : NULL;
+    NSString *detail = message ? [NSString stringWithUTF8String:message] : nil;
+    return detail.length > 0 ? detail : fallback;
+}
+
+static id filzaFileItemAtPath(NSString *path) {
+    Class fileItemClass = NSClassFromString(@"FileItem");
+    if (!fileItemClass || path.length == 0) return nil;
+    id item = [[fileItemClass alloc] init];
+    SEL setter = NSSelectorFromString(@"setFilePath:attribute:");
+    if (![item respondsToSelector:setter]) return nil;
+    ((void(*)(id, SEL, id, id))objc_msgSend)(item, setter, path, nil);
+    return item;
+}
+
+static BOOL filzaWriteArchiveEntry(struct archive *writer,
+                                   NSString *sourcePath,
+                                   NSString *archivePath,
+                                   NSString *outputPath,
+                                   NSString **errorMessage) {
+    if ([sourcePath isEqualToString:outputPath]) return YES;
+
+    struct stat status;
+    if (lstat(sourcePath.fileSystemRepresentation, &status) != 0) {
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:
+            @"Cannot read %@: %s", sourcePath.lastPathComponent,
+            strerror(errno)];
+        return NO;
+    }
+
+    struct archive_entry *entry = archive_entry_new();
+    if (!entry) {
+        if (errorMessage) *errorMessage = @"Cannot allocate ZIP entry";
+        return NO;
+    }
+
+    NSString *entryPath = archivePath;
+    if (S_ISDIR(status.st_mode) && ![entryPath hasSuffix:@"/"])
+        entryPath = [entryPath stringByAppendingString:@"/"];
+    archive_entry_set_pathname_utf8(entry, entryPath.UTF8String);
+    archive_entry_set_perm(entry, status.st_mode & 07777);
+    archive_entry_set_mtime(entry, status.st_mtimespec.tv_sec,
+        status.st_mtimespec.tv_nsec);
+
+    BOOL supported = YES;
+    if (S_ISREG(status.st_mode)) {
+        archive_entry_set_filetype(entry, S_IFREG);
+        archive_entry_set_size(entry, status.st_size);
+    } else if (S_ISDIR(status.st_mode)) {
+        archive_entry_set_filetype(entry, S_IFDIR);
+        archive_entry_set_size(entry, 0);
+    } else if (S_ISLNK(status.st_mode)) {
+        char target[PATH_MAX + 1];
+        ssize_t length = readlink(sourcePath.fileSystemRepresentation, target,
+            PATH_MAX);
+        if (length < 0 || length >= PATH_MAX) {
+            if (errorMessage) *errorMessage = [NSString stringWithFormat:
+                @"Cannot read symbolic link %@: %s", archivePath,
+                strerror(errno)];
+            archive_entry_free(entry);
+            return NO;
+        }
+        target[length] = '\0';
+        archive_entry_set_filetype(entry, S_IFLNK);
+        archive_entry_set_size(entry, 0);
+        archive_entry_set_symlink_utf8(entry, target);
+    } else {
+        supported = NO;
+    }
+
+    if (!supported) {
+        archive_entry_free(entry);
+        NSLog(@"[ZIP] skipped unsupported file type at %@", sourcePath);
+        return YES;
+    }
+
+    int result = archive_write_header(writer, entry);
+    if (result < FILZA_ARCHIVE_WARN) {
+        if (errorMessage) *errorMessage = filzaArchiveError(writer,
+            @"Cannot write ZIP entry");
+        archive_entry_free(entry);
+        return NO;
+    }
+
+    if (S_ISREG(status.st_mode)) {
+        int descriptor = open(sourcePath.fileSystemRepresentation,
+            O_RDONLY | O_NOFOLLOW);
+        if (descriptor < 0) {
+            if (errorMessage) *errorMessage = [NSString stringWithFormat:
+                @"Cannot open %@: %s", archivePath, strerror(errno)];
+            archive_entry_free(entry);
+            return NO;
+        }
+
+        uint8_t buffer[64 * 1024];
+        ssize_t count;
+        BOOL writeSucceeded = YES;
+        while ((count = read(descriptor, buffer, sizeof(buffer))) > 0) {
+            size_t offset = 0;
+            while (offset < (size_t)count) {
+                filza_la_ssize_t written = archive_write_data(writer,
+                    buffer + offset, (size_t)count - offset);
+                if (written <= 0) {
+                    if (errorMessage) *errorMessage = filzaArchiveError(writer,
+                        @"Cannot write ZIP file data");
+                    writeSucceeded = NO;
+                    break;
+                }
+                offset += (size_t)written;
+            }
+            if (!writeSucceeded) break;
+        }
+        if (count < 0 && writeSucceeded) {
+            if (errorMessage) *errorMessage = [NSString stringWithFormat:
+                @"Cannot read %@: %s", archivePath, strerror(errno)];
+            writeSucceeded = NO;
+        }
+        close(descriptor);
+        if (!writeSucceeded) {
+            archive_entry_free(entry);
+            return NO;
+        }
+    }
+
+    result = archive_write_finish_entry(writer);
+    archive_entry_free(entry);
+    if (result < FILZA_ARCHIVE_WARN) {
+        if (errorMessage) *errorMessage = filzaArchiveError(writer,
+            @"Cannot finish ZIP entry");
+        return NO;
+    }
+
+    if (S_ISDIR(status.st_mode)) {
+        NSError *directoryError = nil;
+        NSArray<NSString *> *children = [[NSFileManager defaultManager]
+            contentsOfDirectoryAtPath:sourcePath error:&directoryError];
+        if (!children) {
+            if (errorMessage) *errorMessage = directoryError.localizedDescription;
+            return NO;
+        }
+        for (NSString *child in children) {
+            if (!filzaWriteArchiveEntry(writer,
+                    [sourcePath stringByAppendingPathComponent:child],
+                    [archivePath stringByAppendingPathComponent:child],
+                    outputPath, errorMessage))
+                return NO;
+        }
+    }
+    return YES;
 }
 
 // Hook: -[Zipper ZipFiles:toFilePath:currentDirectory:]
-static id hook_ZipFiles(id self, SEL _cmd, id files, id toFilePath, id currentDirectory) {
+static id hook_ZipFiles(id self, SEL _cmd, id files, id toFilePath,
+                        id currentDirectory) {
     @try {
-        loadMinizip();
-        if (!g_minizipLoaded) return orig_ZipFiles ? ((id(*)(id,SEL,id,id,id))orig_ZipFiles)(self, _cmd, files, toFilePath, currentDirectory) : nil;
-        zipFile64 zf = p_zipOpen64(((NSString *)toFilePath).UTF8String, 0); // APPEND_STATUS_CREATE=0
-        if (!zf) { NSLog(@"[Tweak] zipOpen64 failed"); return nil; }
+        NSString *outputPath = filzaArchiveResolvedPath(toFilePath,
+            currentDirectory);
+        NSString *basePath = filzaArchiveResolvedPath(currentDirectory, nil);
+        if (outputPath.length == 0 || basePath.length == 0) return nil;
 
-        for (id fi in files) {
-            NSString *fn = [fi performSelector:NSSelectorFromString(@"fileName")];
-            if (fn) addFileToZip(zf, currentDirectory, fn);
+        NSString *temporaryPath = [[outputPath stringByDeletingLastPathComponent]
+            stringByAppendingPathComponent:[NSString stringWithFormat:
+                @".%@.%@.tmp", outputPath.lastPathComponent,
+                NSUUID.UUID.UUIDString]];
+        struct archive *writer = archive_write_new();
+        NSString *errorMessage = nil;
+        BOOL succeeded = writer != NULL;
+        if (!writer) errorMessage = @"Cannot initialize ZIP writer";
+        if (succeeded && archive_write_set_format_zip(writer) <
+                FILZA_ARCHIVE_WARN) {
+            errorMessage = filzaArchiveError(writer,
+                @"Cannot initialize ZIP format");
+            succeeded = NO;
         }
-        p_zipClose(zf, NULL);
+        if (succeeded && archive_write_add_filter_none(writer) <
+                FILZA_ARCHIVE_WARN) {
+            errorMessage = filzaArchiveError(writer,
+                @"Cannot initialize ZIP output");
+            succeeded = NO;
+        }
+        if (succeeded && archive_write_open_filename(writer,
+                temporaryPath.fileSystemRepresentation) < FILZA_ARCHIVE_WARN) {
+            errorMessage = filzaArchiveError(writer,
+                @"Cannot create ZIP archive");
+            succeeded = NO;
+        }
 
-        // Return FileItem if zip was created (matching original behavior)
-        if ([[NSFileManager defaultManager] fileExistsAtPath:toFilePath]) {
-            Class FI = NSClassFromString(@"FileItem");
-            if (FI) {
-                id item = [[FI alloc] init];
-                ((void(*)(id,SEL,id,id))objc_msgSend)(item, NSSelectorFromString(@"setFilePath:attribute:"), toFilePath, nil);
-                return item;
+        if (succeeded) {
+            for (id file in files) {
+                NSString *fileName = nil;
+                SEL selector = NSSelectorFromString(@"fileName");
+                if ([file respondsToSelector:selector])
+                    fileName = ((id(*)(id, SEL))objc_msgSend)(file, selector);
+                if (fileName.length == 0)
+                    fileName = filzaArchiveObjectPath(file).lastPathComponent;
+                NSString *sourcePath = filzaArchiveResolvedPath(file,
+                    currentDirectory);
+                if (sourcePath.length == 0 && fileName.length > 0)
+                    sourcePath = [basePath stringByAppendingPathComponent:fileName];
+                if (sourcePath.length == 0 || fileName.length == 0 ||
+                    !filzaWriteArchiveEntry(writer, sourcePath, fileName,
+                        outputPath, &errorMessage)) {
+                    if (!errorMessage) errorMessage = @"Invalid ZIP source path";
+                    succeeded = NO;
+                    break;
+                }
             }
         }
+
+        if (writer) {
+            int closeResult = archive_write_close(writer);
+            if (succeeded && closeResult < FILZA_ARCHIVE_WARN) {
+                errorMessage = filzaArchiveError(writer,
+                    @"Cannot finish ZIP archive");
+                succeeded = NO;
+            }
+            archive_write_free(writer);
+        }
+
+        if (succeeded && rename(temporaryPath.fileSystemRepresentation,
+                outputPath.fileSystemRepresentation) != 0) {
+            errorMessage = [NSString stringWithFormat:
+                @"Cannot save ZIP archive: %s", strerror(errno)];
+            succeeded = NO;
+        }
+        if (!succeeded) {
+            unlink(temporaryPath.fileSystemRepresentation);
+            NSLog(@"[ZIP] create failed for %@: %@", outputPath,
+                errorMessage ?: @"unknown error");
+            return nil;
+        }
+
+        NSLog(@"[ZIP] created %@", outputPath);
+        return filzaFileItemAtPath(outputPath);
+    } @catch (NSException *exception) {
+        NSLog(@"[ZIP] create exception: %@", exception);
         return nil;
-    } @catch (NSException *e) { NSLog(@"[Tweak] Zip error: %@", e); return nil; }
+    }
+}
+
+static NSString *filzaSafeArchiveRelativePath(const char *pathname) {
+    if (!pathname) return nil;
+    NSString *path = [NSString stringWithUTF8String:pathname];
+    if (path.length == 0 || path.isAbsolutePath) return nil;
+    while ([path hasPrefix:@"./"])
+        path = [path substringFromIndex:2];
+    if (path.length == 0 || [path isEqualToString:@"."]) return @"";
+    for (NSString *component in path.pathComponents) {
+        if ([component isEqualToString:@".."])
+            return nil;
+    }
+    path = path.stringByStandardizingPath;
+    return path.isAbsolutePath ? nil : path;
+}
+
+static BOOL filzaPathIsInsideRoot(NSString *path, NSString *root) {
+    return [path isEqualToString:root] ||
+        [path hasPrefix:[root stringByAppendingString:@"/"]];
+}
+
+static BOOL filzaCopyArchiveEntryData(struct archive *reader,
+                                      struct archive *disk,
+                                      NSString **errorMessage) {
+    const void *buffer = NULL;
+    size_t size = 0;
+    filza_la_int64_t offset = 0;
+    for (;;) {
+        int result = archive_read_data_block(reader, &buffer, &size, &offset);
+        if (result == FILZA_ARCHIVE_EOF) return YES;
+        if (result < FILZA_ARCHIVE_OK) {
+            if (errorMessage) *errorMessage = filzaArchiveError(reader,
+                @"Cannot read ZIP entry data");
+            return NO;
+        }
+        if (archive_write_data_block(disk, buffer, size, offset) <
+                FILZA_ARCHIVE_WARN) {
+            if (errorMessage) *errorMessage = filzaArchiveError(disk,
+                @"Cannot write extracted file data");
+            return NO;
+        }
+    }
+}
+
+static NSArray *filzaExtractZip(id zipObject, id toPath, id currentDirectory,
+                                id password, id *outMessage) {
+    NSString *zipPath = filzaArchiveResolvedPath(zipObject, currentDirectory);
+    NSString *destination = filzaArchiveResolvedPath(toPath, currentDirectory);
+    if (zipPath.length == 0 || destination.length == 0) {
+        if (outMessage) *outMessage = @"Invalid ZIP path";
+        return nil;
+    }
+
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    BOOL destinationExisted = [fileManager fileExistsAtPath:destination];
+    NSError *directoryError = nil;
+    if (![fileManager createDirectoryAtPath:destination
+            withIntermediateDirectories:YES attributes:nil
+            error:&directoryError]) {
+        if (outMessage) *outMessage = directoryError.localizedDescription;
+        return nil;
+    }
+    destination = destination.stringByStandardizingPath;
+
+    // /var is itself a system symlink to /private/var on iOS. Passing the
+    // display path to ARCHIVE_EXTRACT_SECURE_SYMLINKS rejects that legitimate
+    // parent before it ever reaches an archive entry. Canonicalize the already
+    // created extraction root, then keep the secure entry-level checks enabled.
+    char canonicalPath[PATH_MAX];
+    if (!realpath(destination.fileSystemRepresentation, canonicalPath)) {
+        NSString *message = [NSString stringWithFormat:
+            @"Cannot resolve extraction directory: %s", strerror(errno)];
+        if (!destinationExisted)
+            [fileManager removeItemAtPath:destination error:nil];
+        if (outMessage) *outMessage = message;
+        return nil;
+    }
+    NSString *destinationRoot = [fileManager
+        stringWithFileSystemRepresentation:canonicalPath
+        length:strlen(canonicalPath)];
+    if (destinationRoot.length == 0) {
+        if (!destinationExisted)
+            [fileManager removeItemAtPath:destination error:nil];
+        if (outMessage) *outMessage = @"Cannot resolve extraction directory";
+        return nil;
+    }
+
+    struct archive *reader = archive_read_new();
+    struct archive *disk = archive_write_disk_new();
+    NSString *errorMessage = nil;
+    BOOL succeeded = reader != NULL && disk != NULL;
+    if (!succeeded) errorMessage = @"Cannot initialize ZIP extractor";
+    if (succeeded) {
+        archive_read_support_filter_all(reader);
+        archive_read_support_format_zip(reader);
+        if ([password isKindOfClass:NSString.class] &&
+                [password length] > 0)
+            archive_read_add_passphrase(reader,
+                ((NSString *)password).UTF8String);
+        archive_write_disk_set_options(disk,
+            FILZA_ARCHIVE_EXTRACT_PERM |
+            FILZA_ARCHIVE_EXTRACT_TIME |
+            FILZA_ARCHIVE_EXTRACT_SECURE_SYMLINKS |
+            FILZA_ARCHIVE_EXTRACT_SECURE_NODOTDOT |
+            FILZA_ARCHIVE_EXTRACT_SAFE_WRITES);
+        archive_write_disk_set_standard_lookup(disk);
+        if (archive_read_open_filename(reader, zipPath.fileSystemRepresentation,
+                64 * 1024) < FILZA_ARCHIVE_WARN) {
+            errorMessage = filzaArchiveError(reader, @"Cannot open ZIP archive");
+            succeeded = NO;
+        }
+    }
+
+    struct archive_entry *entry = NULL;
+    while (succeeded) {
+        int result = archive_read_next_header(reader, &entry);
+        if (result == FILZA_ARCHIVE_EOF) break;
+        if (result < FILZA_ARCHIVE_WARN) {
+            errorMessage = filzaArchiveError(reader,
+                @"Cannot read ZIP entry");
+            succeeded = NO;
+            break;
+        }
+
+        const char *rawPath = archive_entry_pathname_utf8(entry);
+        if (!rawPath) rawPath = archive_entry_pathname(entry);
+        NSString *relativePath = filzaSafeArchiveRelativePath(rawPath);
+        if (!relativePath) {
+            errorMessage = @"ZIP contains an unsafe path";
+            succeeded = NO;
+            break;
+        }
+        if (relativePath.length == 0) {
+            archive_read_data_skip(reader);
+            continue;
+        }
+        if (archive_entry_hardlink_utf8(entry)) {
+            errorMessage = @"ZIP contains an unsupported hard link";
+            succeeded = NO;
+            break;
+        }
+
+        NSString *outputPath = [[destinationRoot
+            stringByAppendingPathComponent:relativePath]
+            stringByStandardizingPath];
+        if (!filzaPathIsInsideRoot(outputPath, destinationRoot)) {
+            errorMessage = @"ZIP entry escapes the destination directory";
+            succeeded = NO;
+            break;
+        }
+
+        const char *symlink = archive_entry_symlink_utf8(entry);
+        if (symlink) {
+            NSString *target = [NSString stringWithUTF8String:symlink];
+            if (target.length == 0 || target.isAbsolutePath) {
+                errorMessage = @"ZIP contains an unsafe symbolic link";
+                succeeded = NO;
+                break;
+            }
+            NSString *resolvedTarget = [[[outputPath
+                stringByDeletingLastPathComponent]
+                stringByAppendingPathComponent:target]
+                stringByStandardizingPath];
+            if (!filzaPathIsInsideRoot(resolvedTarget, destinationRoot)) {
+                errorMessage = @"ZIP symbolic link escapes the destination";
+                succeeded = NO;
+                break;
+            }
+        }
+
+        mode_t fileType = archive_entry_filetype(entry);
+        if (fileType != S_IFREG && fileType != S_IFDIR &&
+                fileType != S_IFLNK) {
+            archive_read_data_skip(reader);
+            continue;
+        }
+
+        archive_entry_set_pathname_utf8(entry, outputPath.UTF8String);
+        result = archive_write_header(disk, entry);
+        if (result < FILZA_ARCHIVE_WARN) {
+            errorMessage = filzaArchiveError(disk,
+                @"Cannot create extracted ZIP entry");
+            succeeded = NO;
+            break;
+        }
+        if (!filzaCopyArchiveEntryData(reader, disk, &errorMessage)) {
+            succeeded = NO;
+            break;
+        }
+        if (archive_write_finish_entry(disk) < FILZA_ARCHIVE_WARN) {
+            errorMessage = filzaArchiveError(disk,
+                @"Cannot finish extracted ZIP entry");
+            succeeded = NO;
+            break;
+        }
+
+    }
+
+    if (reader) {
+        archive_read_close(reader);
+        archive_read_free(reader);
+    }
+    if (disk) {
+        archive_write_close(disk);
+        archive_write_free(disk);
+    }
+
+    if (!succeeded) {
+        if (!destinationExisted) {
+            NSError *cleanupError = nil;
+            if (![fileManager removeItemAtPath:destination
+                    error:&cleanupError] && cleanupError)
+                NSLog(@"[ZIP] cleanup failed for %@: %@", destination,
+                    cleanupError.localizedDescription);
+        }
+        if (outMessage) *outMessage = errorMessage ?: @"Cannot extract ZIP";
+        NSLog(@"[ZIP] extract failed for %@: %@", zipPath,
+            errorMessage ?: @"unknown error");
+        return nil;
+    }
+
+    // Zipper's caller expects the extraction wrapper itself here. It then
+    // applies Filza's extract-location preference, moves the wrapper's
+    // children into the current directory when requested, and publishes the
+    // resulting FileItems to the visible browser. Returning archive entries
+    // instead leaves the wrapper unannounced and makes a one-item archive
+    // appear as test/test.txt (or test/test) until the browser is reopened.
+    id destinationItem = filzaFileItemAtPath(destination);
+    if (!destinationItem) {
+        if (outMessage) *outMessage = @"Cannot create extracted item";
+        return nil;
+    }
+    if (outMessage) *outMessage = @"OK";
+    NSLog(@"[ZIP] extracted %@ to %@", zipPath, destination);
+    return @[destinationItem];
 }
 
 // Hook: -[Zipper unZipFile:toPath:currentDirectory:outMessage:]
-static id hook_unZipFile(id self, SEL _cmd, id zipPath, id toPath, id currentDir, id *outMsg) {
+static id hook_unZipFile(id self, SEL _cmd, id zipPath, id toPath,
+                         id currentDirectory, id *outMessage) {
     @try {
-        loadMinizip();
-        if (!g_minizipLoaded) return orig_unZipFile ? ((id(*)(id,SEL,id,id,id,id*))orig_unZipFile)(self, _cmd, zipPath, toPath, currentDir, outMsg) : nil;
-        // zipPath is a FileItem, get the actual path string
-        NSString *zipPathStr = zipPath;
-        if ([zipPath respondsToSelector:NSSelectorFromString(@"filePath")])
-            zipPathStr = [zipPath performSelector:NSSelectorFromString(@"filePath")];
-
-        unzFile64 uf = p_unzOpen64(((NSString *)zipPathStr).UTF8String);
-        if (!uf) { if (outMsg) *outMsg = @"Failed to open zip"; return nil; }
-
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *destPath = toPath;
-        [fm createDirectoryAtPath:destPath withIntermediateDirectories:YES attributes:nil error:nil];
-
-        char filename[512];
-        uint8_t buf[32768];
-        int ret = p_unzGoToFirstFile(uf);
-        while (ret == 0) {
-            p_unzGetCurrentFileInfo64(uf, NULL, filename, sizeof(filename), NULL, 0, NULL, 0);
-            NSString *name = [NSString stringWithUTF8String:filename];
-            NSString *fullPath = [destPath stringByAppendingPathComponent:name];
-
-            if ([name hasSuffix:@"/"]) {
-                [fm createDirectoryAtPath:fullPath withIntermediateDirectories:YES attributes:nil error:nil];
-            } else {
-                [fm createDirectoryAtPath:[fullPath stringByDeletingLastPathComponent]
-                  withIntermediateDirectories:YES attributes:nil error:nil];
-
-                if (p_unzOpenCurrentFilePassword(uf, NULL) == 0) {
-                    NSMutableData *fileData = [NSMutableData data];
-                    int bytesRead;
-                    while ((bytesRead = p_unzReadCurrentFile(uf, buf, sizeof(buf))) > 0)
-                        [fileData appendBytes:buf length:bytesRead];
-                    p_unzCloseCurrentFile(uf);
-                    [fileData writeToFile:fullPath atomically:YES];
-                }
-            }
-            ret = p_unzGoToNextFile(uf);
-        }
-        p_unzClose(uf);
-
-        if (outMsg) *outMsg = @"OK";
-
-        // Return array of extracted FileItems (matching original behavior)
-        NSArray *contents = [fm contentsOfDirectoryAtPath:destPath error:nil];
-        if (contents.count > 0) {
-            Class FI = NSClassFromString(@"FileItem");
-            if (FI) {
-                id item = [[FI alloc] init];
-                ((void(*)(id,SEL,id,id))objc_msgSend)(item, NSSelectorFromString(@"setFilePath:attribute:"), destPath, nil);
-                return @[item];
-            }
-        }
+        return filzaExtractZip(zipPath, toPath, currentDirectory, nil,
+            outMessage);
+    } @catch (NSException *exception) {
+        if (outMessage) *outMessage = exception.reason;
+        NSLog(@"[ZIP] extract exception: %@", exception);
         return nil;
-    } @catch (NSException *e) { NSLog(@"[Tweak] Unzip error: %@", e); if (outMsg) *outMsg = [e reason]; return nil; }
+    }
 }
 
 // Hook: -[Zipper unZipFile:toPath:currentDirectory:withPassword:outMessage:]
-static id hook_unZipFilePassword(id self, SEL _cmd, id zipPath, id toPath, id currentDir, id password, id *outMsg) {
-    return hook_unZipFile(self, @selector(unZipFile:toPath:currentDirectory:outMessage:), zipPath, toPath, currentDir, outMsg);
+static id hook_unZipFilePassword(id self, SEL _cmd, id zipPath, id toPath,
+                                 id currentDirectory, id password,
+                                 id *outMessage) {
+    @try {
+        return filzaExtractZip(zipPath, toPath, currentDirectory, password,
+            outMessage);
+    } @catch (NSException *exception) {
+        if (outMessage) *outMessage = exception.reason;
+        NSLog(@"[ZIP] password extract exception: %@", exception);
+        return nil;
+    }
+}
+
+static NSData *filzaDataInZip(id zipObject, NSString *entryName) {
+    NSString *zipPath = filzaArchiveResolvedPath(zipObject, nil);
+    if (zipPath.length == 0 || entryName.length == 0) return nil;
+
+    struct archive *reader = archive_read_new();
+    if (!reader) return nil;
+    archive_read_support_filter_all(reader);
+    archive_read_support_format_zip(reader);
+    if (archive_read_open_filename(reader, zipPath.fileSystemRepresentation,
+            64 * 1024) < FILZA_ARCHIVE_WARN) {
+        archive_read_free(reader);
+        return nil;
+    }
+
+    NSMutableData *data = nil;
+    struct archive_entry *entry = NULL;
+    for (;;) {
+        int result = archive_read_next_header(reader, &entry);
+        if (result == FILZA_ARCHIVE_EOF) break;
+        if (result < FILZA_ARCHIVE_WARN) break;
+        const char *rawPath = archive_entry_pathname_utf8(entry);
+        if (!rawPath) rawPath = archive_entry_pathname(entry);
+        NSString *path = filzaSafeArchiveRelativePath(rawPath);
+        if (![path isEqualToString:entryName]) {
+            archive_read_data_skip(reader);
+            continue;
+        }
+
+        data = [NSMutableData data];
+        uint8_t buffer[64 * 1024];
+        filza_la_ssize_t count;
+        while ((count = archive_read_data(reader, buffer,
+                sizeof(buffer))) > 0)
+            [data appendBytes:buffer length:(NSUInteger)count];
+        if (count < 0) data = nil;
+        break;
+    }
+    archive_read_close(reader);
+    archive_read_free(reader);
+    return data;
+}
+
+static id hook_dataInZipFilePath(id self, SEL _cmd, id zipPath, id name) {
+    NSData *data = filzaDataInZip(zipPath, name);
+    if (data || !orig_dataInZipFilePath) return data;
+    return ((id(*)(id, SEL, id, id))orig_dataInZipFilePath)(self, _cmd,
+        zipPath, name);
+}
+
+static id hook_dataInZipFile(id self, SEL _cmd, id zipFile, id name) {
+    NSData *data = filzaDataInZip(zipFile, name);
+    if (data || !orig_dataInZipFile) return data;
+    return ((id(*)(id, SEL, id, id))orig_dataInZipFile)(self, _cmd,
+        zipFile, name);
 }
 
 #pragma mark - Apps Manager Fix
@@ -1203,12 +1702,54 @@ static char kAppManagerSearchMatchesKey;
 static char kAppManagerSearchSourceBrowserKey;
 static char kAppManagerSearchSourceControllerKey;
 static IMP orig_appManagerSearchButton = NULL;
+static IMP orig_appManagerSortMode = NULL;
 static IMP orig_searchControllerTextDidChange = NULL;
 static IMP orig_searchControllerViewDidLoad = NULL;
 static IMP orig_searchControllerNumberOfItems = NULL;
 static IMP orig_searchControllerItemAtIndexPath = NULL;
 static IMP orig_searchControllerDidSelectItem = NULL;
 static BOOL gAppManagerSearchHooksInstalled = NO;
+static BOOL gAppManagerSortHookInstalled = NO;
+
+static void hook_appManagerSortMode(id self, SEL _cmd, id toolbar,
+                                    id sortInfo) {
+    if (orig_appManagerSortMode)
+        ((void(*)(id, SEL, id, id))orig_appManagerSortMode)(self, _cmd,
+            toolbar, sortInfo);
+
+    // TIGIBrowserView clears currentSortMode on the third tap but its empty
+    // dictionary branch omits the same delegate callback and reload used by
+    // ascending/descending. Complete that branch for ApplicationsBrowserView.
+    if (![sortInfo isKindOfClass:NSDictionary.class] ||
+            [(NSDictionary *)sortInfo count] != 0)
+        return;
+
+    id controller = appManagerObjectValue(self,
+        NSSelectorFromString(@"viewController"));
+    SEL loadSelector = NSSelectorFromString(@"loadFilesWithSortMode:");
+    if (![controller respondsToSelector:loadSelector])
+        controller = appManagerObjectValue(self,
+            NSSelectorFromString(@"delegate"));
+    if (![controller respondsToSelector:loadSelector])
+        controller = appManagerObjectValue(self,
+            NSSelectorFromString(@"dataSource"));
+
+    if ([controller respondsToSelector:loadSelector]) {
+        // sortWithMode:0 only compares the already-sorted array. Re-enumerate
+        // the application catalogue so mode 0 gets its original source order,
+        // which is the same effective operation as the successful pull refresh.
+        ((void(*)(id, SEL, int))objc_msgSend)(controller, loadSelector, 0);
+        NSLog(@"[MHA-APPMGR] reloaded catalogue for unsorted mode");
+        return;
+    }
+
+    SEL callback = NSSelectorFromString(@"browserView:willSortWithSortMode:");
+    if ([controller respondsToSelector:callback])
+        ((void(*)(id, SEL, id, int))objc_msgSend)(controller, callback,
+            self, 0);
+    if ([self respondsToSelector:@selector(reloadData)])
+        ((void(*)(id, SEL))objc_msgSend)(self, @selector(reloadData));
+}
 
 static dispatch_queue_t appManagerSearchDiagnosticsQueue(void) {
     static dispatch_queue_t queue;
@@ -1637,6 +2178,23 @@ static void installAppManagerHooks(void) {
 
     Class browserClass = NSClassFromString(@"ApplicationsBrowserView");
     if (browserClass) {
+        SEL sortSelector = NSSelectorFromString(
+            @"TopToolbarView:didSelectSortMode:");
+        Method sortMethod = class_getInstanceMethod(browserClass,
+            sortSelector);
+        IMP currentSort = class_getMethodImplementation(browserClass,
+            sortSelector);
+        if (sortMethod && currentSort != (IMP)hook_appManagerSortMode) {
+            if (!orig_appManagerSortMode)
+                orig_appManagerSortMode = currentSort;
+            class_replaceMethod(browserClass, sortSelector,
+                (IMP)hook_appManagerSortMode,
+                method_getTypeEncoding(sortMethod));
+        }
+        gAppManagerSortHookInstalled = sortMethod &&
+            class_getMethodImplementation(browserClass, sortSelector) ==
+                (IMP)hook_appManagerSortMode;
+
         SEL tableSelector =
             NSSelectorFromString(@"tableView:cellForRowAtIndexPath:");
         Method tableMethod = class_getInstanceMethod(browserClass,
@@ -1775,12 +2333,12 @@ static void installAppManagerHooks(void) {
         method_getImplementation(searchDidSelectMethod) ==
                 (IMP)hook_searchControllerDidSelectItem;
 
-    NSLog(@"[MHA-APPMGR] hooks workspace=%d appItem=%d setter=%d fileName=%d iconPath=%d controller=%d sizes=%d cells=%d search=%d build=AppManager-CachedDiskUsage-NoFreeze-v20",
+    NSLog(@"[MHA-APPMGR] hooks workspace=%d appItem=%d setter=%d fileName=%d iconPath=%d controller=%d sizes=%d cells=%d search=%d sort=%d build=AppManager-CachedDiskUsage-NoFreeze-v20",
         gLSWorkspaceHookInstalled, appItem != Nil,
         gAppItemSetterHookInstalled, gAppItemFileNameHookInstalled,
         gAppItemIconHookInstalled, applicationsController != Nil,
         gAppSizeHooksInstalled, gAppBrowserCellHooksInstalled,
-        gAppManagerSearchHooksInstalled);
+        gAppManagerSearchHooksInstalled, gAppManagerSortHookInstalled);
 }
 
 #pragma mark - License / Integrity Bypass
@@ -2510,6 +3068,152 @@ static void hook_copyFilesAndDirectoryFromPasteboard(id self, SEL _cmd) {
     });
 }
 
+static NSError *externalDropError(NSString *description, NSError *underlying) {
+    NSMutableDictionary *info = [NSMutableDictionary dictionary];
+    info[NSLocalizedDescriptionKey] = description.length > 0
+        ? description : @"The dropped file could not be loaded.";
+    if (underlying) info[NSUnderlyingErrorKey] = underlying;
+    return [NSError errorWithDomain:NSCocoaErrorDomain
+        code:NSFileReadUnknownError userInfo:info];
+}
+
+static NSArray<NSString *> *externalDropTypeIdentifiers(NSItemProvider *provider) {
+    NSMutableArray<NSString *> *identifiers = [NSMutableArray array];
+    for (id value in provider.registeredTypeIdentifiers) {
+        if (![value isKindOfClass:NSString.class] || [value length] == 0)
+            continue;
+        NSString *identifier = value;
+        // Loading NSURL/public.file-url is the Filza 4.0 path that crashes in
+        // iPadOS 27's NSFileCoordinator. Ask for a copied file representation
+        // of the payload type instead.
+        if ([identifier isEqualToString:@"public.file-url"] ||
+            [identifier isEqualToString:@"public.url"])
+            continue;
+        if (![identifiers containsObject:identifier])
+            [identifiers addObject:identifier];
+    }
+    for (NSString *fallback in @[@"public.data", @"public.folder",
+                                  @"public.item"]) {
+        if (![identifiers containsObject:fallback] &&
+            [provider hasItemConformingToTypeIdentifier:fallback])
+            [identifiers addObject:fallback];
+    }
+    return identifiers.copy;
+}
+
+typedef void (^ExternalDropRepresentationCompletion)(NSURL *URL,
+                                                       NSError *error);
+
+static void loadExternalDropRepresentation(NSItemProvider *provider,
+                                            NSArray<NSString *> *identifiers,
+                                            NSUInteger index,
+                                            NSError *lastError,
+                                            ExternalDropRepresentationCompletion completion) {
+    if (index >= identifiers.count) {
+        NSString *name = provider.suggestedName ?: @"item";
+        completion(nil, externalDropError(
+            [NSString stringWithFormat:@"Cannot load dropped file %@.", name],
+            lastError));
+        return;
+    }
+
+    NSString *identifier = identifiers[index];
+    [provider loadFileRepresentationForTypeIdentifier:identifier
+        completionHandler:^(NSURL *URL, NSError *error) {
+            if (URL.isFileURL) {
+                completion(URL, nil);
+                return;
+            }
+            loadExternalDropRepresentation(provider, identifiers, index + 1,
+                error ?: lastError, completion);
+        }];
+}
+
+static NSString *externalDropFileName(NSItemProvider *provider, NSURL *URL) {
+    NSString *name = provider.suggestedName;
+    if (name.length == 0) name = URL.lastPathComponent;
+    name = name.lastPathComponent;
+    if (name.length == 0 || [name isEqualToString:@"."] ||
+        [name isEqualToString:@".."]) return @"Dropped Item";
+    return name;
+}
+
+static IMP orig_fileSystemPerformDrop = NULL;
+static void hook_fileSystemPerformDrop(id self, SEL _cmd,
+                                       UIDropInteraction *interaction,
+                                       id<UIDropSession> session) {
+    SEL currentPathSelector = NSSelectorFromString(@"currentPath");
+    NSArray<UIDragItem *> *items = session.items;
+    if (session.localDragSession || items.count == 0 ||
+        ![self respondsToSelector:currentPathSelector]) {
+        if (orig_fileSystemPerformDrop)
+            ((void(*)(id, SEL, id, id))orig_fileSystemPerformDrop)(
+                self, _cmd, interaction, session);
+        return;
+    }
+
+    MCMFilzaStart();
+    id pathValue = ((id(*)(id, SEL))objc_msgSend)(self, currentPathSelector);
+    NSString *destinationDirectory = localPathFromPasteboardValue(pathValue);
+    BOOL isDirectory = NO;
+    if (destinationDirectory.length == 0 ||
+        ![NSFileManager.defaultManager fileExistsAtPath:destinationDirectory
+            isDirectory:&isDirectory] || !isDirectory) {
+        if (orig_fileSystemPerformDrop)
+            ((void(*)(id, SEL, id, id))orig_fileSystemPerformDrop)(
+                self, _cmd, interaction, session);
+        return;
+    }
+
+    UIViewController *controller = self;
+    NSMutableArray<NSError *> *errors = [NSMutableArray array];
+    __block NSUInteger copied = 0;
+    __block void (^processItem)(NSUInteger) = nil;
+    processItem = ^(NSUInteger index) {
+        if (index >= items.count) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                reloadFileSystemController(controller);
+                showPasteFailure(controller, errors);
+                NSLog(@"[ExternalDrop] complete copied=%lu failed=%lu destination=%@",
+                    (unsigned long)copied, (unsigned long)errors.count,
+                    destinationDirectory);
+            });
+            processItem = nil;
+            return;
+        }
+
+        NSItemProvider *provider = items[index].itemProvider;
+        NSArray<NSString *> *identifiers =
+            externalDropTypeIdentifiers(provider);
+        loadExternalDropRepresentation(provider, identifiers, 0, nil,
+            ^(NSURL *URL, NSError *loadError) {
+                NSError *error = loadError;
+                if (URL) {
+                    NSString *name = externalDropFileName(provider, URL);
+                    NSString *destination = uniquePasteDestination(
+                        destinationDirectory, name);
+                    BOOL scoped = [URL startAccessingSecurityScopedResource];
+                    if (!destination) {
+                        setPastePOSIXError(&error, EEXIST,
+                            @"choose destination", name);
+                    } else if (directCopyItem(URL.path, destination, &error)) {
+                        copied++;
+                        NSLog(@"[ExternalDrop] copied %@ -> %@", URL.path,
+                            destination);
+                    }
+                    if (scoped) [URL stopAccessingSecurityScopedResource];
+                }
+                if (error) {
+                    [errors addObject:error];
+                    NSLog(@"[ExternalDrop] failed: %@",
+                        error.localizedDescription);
+                }
+                processItem(index + 1);
+            });
+    };
+    processItem(0);
+}
+
 static void runOptInPasteCopyProbe(void) {
     if (!getenv("FILZA_PASTE_PROBE")) return;
     NSString *source = [NSSearchPathForDirectoriesInDomains(
@@ -2570,6 +3274,20 @@ static void installHooks(void) {
                     (IMP)hook_fileSystemUpdateEditableUI, types))
                 method_setImplementation(updateEditableUI,
                     (IMP)hook_fileSystemUpdateEditableUI);
+        }
+
+        SEL performDropSelector =
+            NSSelectorFromString(@"dropInteraction:performDrop:");
+        Method performDrop = class_getInstanceMethod(fileSystemController,
+            performDropSelector);
+        if (performDrop && method_getImplementation(performDrop) !=
+                (IMP)hook_fileSystemPerformDrop) {
+            orig_fileSystemPerformDrop = method_getImplementation(performDrop);
+            const char *types = method_getTypeEncoding(performDrop);
+            if (!class_addMethod(fileSystemController, performDropSelector,
+                    (IMP)hook_fileSystemPerformDrop, types))
+                method_setImplementation(performDrop,
+                    (IMP)hook_fileSystemPerformDrop);
         }
 
         SEL pageDeleteSelector = NSSelectorFromString(@"pageDeleteAction");
@@ -2685,11 +3403,32 @@ static void installHooks(void) {
     if (zipper) {
         Method m;
         m = class_getInstanceMethod(zipper, NSSelectorFromString(@"ZipFiles:toFilePath:currentDirectory:"));
-        if (m) { orig_ZipFiles = method_getImplementation(m); method_setImplementation(m, (IMP)hook_ZipFiles); }
+        if (m && method_getImplementation(m) != (IMP)hook_ZipFiles) {
+            orig_ZipFiles = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_ZipFiles);
+        }
         m = class_getInstanceMethod(zipper, NSSelectorFromString(@"unZipFile:toPath:currentDirectory:outMessage:"));
-        if (m) { orig_unZipFile = method_getImplementation(m); method_setImplementation(m, (IMP)hook_unZipFile); }
+        if (m && method_getImplementation(m) != (IMP)hook_unZipFile) {
+            orig_unZipFile = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_unZipFile);
+        }
         m = class_getInstanceMethod(zipper, NSSelectorFromString(@"unZipFile:toPath:currentDirectory:withPassword:outMessage:"));
-        if (m) { orig_unZipFilePassword = method_getImplementation(m); method_setImplementation(m, (IMP)hook_unZipFilePassword); }
+        if (m && method_getImplementation(m) != (IMP)hook_unZipFilePassword) {
+            orig_unZipFilePassword = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_unZipFilePassword);
+        }
+        m = class_getInstanceMethod(zipper,
+            NSSelectorFromString(@"dataInZipFilePath:withName:"));
+        if (m && method_getImplementation(m) != (IMP)hook_dataInZipFilePath) {
+            orig_dataInZipFilePath = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_dataInZipFilePath);
+        }
+        m = class_getInstanceMethod(zipper,
+            NSSelectorFromString(@"dataInZipFile:withName:"));
+        if (m && method_getImplementation(m) != (IMP)hook_dataInZipFile) {
+            orig_dataInZipFile = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_dataInZipFile);
+        }
     }
 
     // License/integrity bypass

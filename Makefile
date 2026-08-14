@@ -23,7 +23,7 @@ FilzaApplySandboxExt_OBJCCFLAGS = $(FilzaApplySandboxExt_CFLAGS)
 
 FilzaApplySandboxExt_FRAMEWORKS = UIKit Foundation IOKit CoreFoundation Security SystemConfiguration
 FilzaApplySandboxExt_PRIVATE_FRAMEWORKS = IOSurface
-FilzaApplySandboxExt_LIBRARIES = z sandbox c++
+FilzaApplySandboxExt_LIBRARIES = archive z sandbox c++
 FilzaApplySandboxExt_LDFLAGS += $(PWD)/vendor/idevice/libidevice_ffi.a
 
 FilzaApplySandboxExt_INSTALL_TARGET_PROCESSES = Filza
