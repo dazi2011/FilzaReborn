@@ -28,7 +28,7 @@ cd "$REPO_ROOT"
 make clean
 make package FINALPACKAGE=1
 
-DYLIB="$REPO_ROOT/.theos/obj/FilzaApplySandboxExt.dylib"
+DYLIB="$REPO_ROOT/.theos/obj/arm64/FilzaApplySandboxExt.dylib"
 [[ -f "$DYLIB" ]] || { echo "built dylib not found: $DYLIB" >&2; exit 70; }
 
 STAGE_ROOT="$(mktemp -d /tmp/FilzaSlop-release.XXXXXX)"
@@ -49,7 +49,7 @@ if codesign -d "$APP" >/dev/null 2>&1; then
   exit 65
 fi
 
-LOCAL_NETWORK_REASON="Filza uses LocalDevVPN briefly to refresh App Manager names and icons from this device."
+LOCAL_NETWORK_REASON="Filza uses LocalDevVPN to refresh App Manager names, icons, and disk usage from this device."
 if ! plutil -replace NSLocalNetworkUsageDescription -string "$LOCAL_NETWORK_REASON" "$APP/Info.plist" 2>/dev/null; then
   plutil -insert NSLocalNetworkUsageDescription -string "$LOCAL_NETWORK_REASON" "$APP/Info.plist"
 fi

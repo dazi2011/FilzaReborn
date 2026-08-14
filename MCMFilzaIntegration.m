@@ -618,6 +618,40 @@ BOOL MCMFilzaEnsureAppDataLink(NSString *identifier, NSString **error)
     return NO;
 }
 
+BOOL MCMFilzaRemoveAppDataLink(NSString *identifier, NSString **error)
+{
+    if (!MCMSafeIdentifier(identifier)) {
+        if (error) *error = @"identifier contains unsupported path characters";
+        return NO;
+    }
+    NSString *link = [[[MCMFilzaVirtualRoot()
+        stringByAppendingPathComponent:kMCMAppDataDirectoryName]
+        stringByAppendingPathComponent:identifier] stringByStandardizingPath];
+    struct stat status = {0};
+    if (lstat(link.fileSystemRepresentation, &status) != 0) {
+        if (errno == ENOENT) return YES;
+        if (error) *error = [NSString stringWithFormat:
+            @"lstat failed errno=%d", errno];
+        return NO;
+    }
+    if (!S_ISLNK(status.st_mode)) {
+        if (error) *error = @"refused to remove a non-symlink App Data entry";
+        return NO;
+    }
+    if (unlink(link.fileSystemRepresentation) != 0) {
+        if (error) *error = [NSString stringWithFormat:
+            @"unlink failed errno=%d", errno];
+        return NO;
+    }
+    @synchronized (gLeases) {
+        NSString *key = MCMKey(2, identifier);
+        MCMLease *lease = gLeases[key];
+        [lease invalidate];
+        [gLeases removeObjectForKey:key];
+    }
+    return YES;
+}
+
 static NSString *MCMDirectIdentifier(NSString *containerPath, NSString *fallback)
 {
     NSString *metadataPath = [containerPath stringByAppendingPathComponent:

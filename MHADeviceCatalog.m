@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdlib.h>
@@ -49,6 +50,8 @@ extern IdeviceFfiError *installation_proxy_connect(IdeviceProviderHandle *,
 extern IdeviceFfiError *installation_proxy_get_apps(
     InstallationProxyClientHandle *, const char *, const char *const *, size_t,
     void **, size_t *);
+extern IdeviceFfiError *installation_proxy_browse(
+    InstallationProxyClientHandle *, plist_t, plist_t **, size_t *);
 extern void installation_proxy_client_free(InstallationProxyClientHandle *);
 extern IdeviceFfiError *springboard_services_connect_rsd(AdapterHandle *,
     RsdHandshakeHandle *, SpringBoardServicesClientHandle **);
@@ -59,6 +62,11 @@ extern IdeviceFfiError *springboard_services_get_icon(
 extern void springboard_services_free(SpringBoardServicesClientHandle *);
 extern void idevice_error_free(IdeviceFfiError *);
 extern void idevice_data_free(uint8_t *, uintptr_t);
+extern plist_t plist_new_dict(void);
+extern plist_t plist_new_array(void);
+extern plist_t plist_new_string(const char *);
+extern void plist_array_append_item(plist_t, plist_t);
+extern void plist_dict_set_item(plist_t, const char *, plist_t);
 extern int plist_to_bin(plist_t, char **, uint32_t *);
 extern void plist_mem_free(void *);
 extern void plist_free(plist_t);
@@ -206,6 +214,12 @@ static NSString *firstString(NSDictionary *dictionary,
     return nil;
 }
 
+static NSNumber *nonnegativeDiskUsage(id value) {
+    if (![value isKindOfClass:NSNumber.class]) return nil;
+    if ([(NSNumber *)value longLongValue] < 0) return nil;
+    return @([(NSNumber *)value unsignedLongLongValue]);
+}
+
 static NSDictionary *sanitizedRecord(NSDictionary *dictionary) {
     NSString *identifier = firstString(dictionary,
         @[@"CFBundleIdentifier", @"BundleIdentifier"]);
@@ -218,6 +232,10 @@ static NSDictionary *sanitizedRecord(NSDictionary *dictionary) {
         @[@"CFBundleVersion", @"BundleVersion"]);
     NSString *applicationType = firstString(dictionary,
         @[@"ApplicationType"]);
+    NSNumber *staticDiskUsage = nonnegativeDiskUsage(
+        dictionary[@"StaticDiskUsage"]);
+    NSNumber *dynamicDiskUsage = nonnegativeDiskUsage(
+        dictionary[@"DynamicDiskUsage"]);
 
     NSMutableDictionary *record = [NSMutableDictionary dictionaryWithObject:
         identifier forKey:@"BundleIdentifier"];
@@ -226,6 +244,8 @@ static NSDictionary *sanitizedRecord(NSDictionary *dictionary) {
     if (bundleVersion.length > 0) record[@"BundleVersion"] = bundleVersion;
     if (applicationType.length > 0)
         record[@"ApplicationType"] = applicationType;
+    if (staticDiskUsage) record[@"StaticDiskUsage"] = staticDiskUsage;
+    if (dynamicDiskUsage) record[@"DynamicDiskUsage"] = dynamicDiskUsage;
     return record;
 }
 
@@ -259,7 +279,7 @@ static void writeDiagnostics(NSString *status, NSURL *pairingURL,
                              NSUInteger iconsCached, NSUInteger iconFailures) {
     NSString *report = [NSString stringWithFormat:
         @"App Manager RSD catalogue diagnostics\n\n"
-         "Build marker: AppManager-SearchSync-v12\n"
+         "Build marker: AppManager-CachedDiskUsage-NoFreeze-v20\n"
          "Updated: %@\n"
          "Target: %@:%u\n"
          "Transport: %@\n"
@@ -272,7 +292,7 @@ static void writeDiagnostics(NSString *status, NSURL *pairingURL,
          "Icons reused from cache: %lu\n"
          "Icon failures: %lu\n"
          "Cache: %@\n\n"
-         "Names, bundle identifiers, versions, and icons come from the device's "
+         "Names, bundle identifiers, versions, disk usage, and icons come from the device's "
          "installation_proxy and SpringBoardServices through the selected transport. "
          "No .app directory is scanned.\n",
         [NSDate date], kTargetIPAddress, gDiagnosticTargetPort,
@@ -348,6 +368,26 @@ NSString *MHADeviceCatalogApplicationType(NSString *bundleIdentifier) {
     return MHADeviceCatalogMetadata(bundleIdentifier)[@"ApplicationType"];
 }
 
+NSNumber *MHADeviceCatalogStaticDiskUsage(NSString *bundleIdentifier) {
+    return nonnegativeDiskUsage(
+        MHADeviceCatalogMetadata(bundleIdentifier)[@"StaticDiskUsage"]);
+}
+
+NSNumber *MHADeviceCatalogDynamicDiskUsage(NSString *bundleIdentifier) {
+    return nonnegativeDiskUsage(
+        MHADeviceCatalogMetadata(bundleIdentifier)[@"DynamicDiskUsage"]);
+}
+
+NSNumber *MHADeviceCatalogTotalDiskUsage(NSString *bundleIdentifier) {
+    NSNumber *staticUsage = MHADeviceCatalogStaticDiskUsage(bundleIdentifier);
+    NSNumber *dynamicUsage = MHADeviceCatalogDynamicDiskUsage(bundleIdentifier);
+    if (!staticUsage || !dynamicUsage) return nil;
+    unsigned long long staticBytes = staticUsage.unsignedLongLongValue;
+    unsigned long long dynamicBytes = dynamicUsage.unsignedLongLongValue;
+    if (ULLONG_MAX - staticBytes < dynamicBytes) return nil;
+    return @(staticBytes + dynamicBytes);
+}
+
 NSString *MHADeviceCatalogIconPath(NSString *bundleIdentifier) {
     NSString *fileName = safeIconFileName(bundleIdentifier);
     if (fileName.length == 0) return nil;
@@ -358,6 +398,69 @@ NSString *MHADeviceCatalogIconPath(NSString *bundleIdentifier) {
 NSString *MHADeviceCatalogStatus(void) {
     MHADeviceCatalogLoadCache();
     @synchronized (catalogLock()) { return gCatalogStatus.copy; }
+}
+
+static NSString *diskUsageValue(NSNumber *value) {
+    return value ? value.stringValue : @"unavailable";
+}
+
+static void writeDiskUsageDiagnostics(NSString *status,
+                                      NSDictionary *records,
+                                      NSDictionary<NSString *, NSString *> *states) {
+    NSArray<NSString *> *identifiers = [records.allKeys
+        sortedArrayUsingSelector:@selector(localizedStandardCompare:)];
+    NSUInteger complete = 0, preserved = 0, unavailable = 0;
+    NSMutableString *details = [NSMutableString string];
+    for (NSString *identifier in identifiers) {
+        NSDictionary *record = [records[identifier]
+            isKindOfClass:NSDictionary.class] ? records[identifier] : @{};
+        NSNumber *staticUsage = nonnegativeDiskUsage(record[@"StaticDiskUsage"]);
+        NSNumber *dynamicUsage = nonnegativeDiskUsage(record[@"DynamicDiskUsage"]);
+        NSNumber *totalUsage = nil;
+        if (staticUsage && dynamicUsage) {
+            unsigned long long staticBytes = staticUsage.unsignedLongLongValue;
+            unsigned long long dynamicBytes = dynamicUsage.unsignedLongLongValue;
+            if (ULLONG_MAX - staticBytes >= dynamicBytes)
+                totalUsage = @(staticBytes + dynamicBytes);
+        }
+        NSString *state = states[identifier];
+        if (state.length == 0)
+            state = totalUsage ? @"cached after refresh failure" : @"unavailable";
+        if ([state hasPrefix:@"fresh"])
+            complete++;
+        else if ([state containsString:@"preserved"] ||
+                 [state hasPrefix:@"cached"])
+            preserved++;
+        else
+            unavailable++;
+        [details appendFormat:
+            @"%@\tstatus=%@\tstatic=%@\tdynamic=%@\ttotal=%@\n",
+            identifier, state, diskUsageValue(staticUsage),
+            diskUsageValue(dynamicUsage), diskUsageValue(totalUsage)];
+    }
+
+    NSString *report = [NSString stringWithFormat:
+        @"App Manager disk usage diagnostics\n\n"
+         "Build marker: AppManager-CachedDiskUsage-NoFreeze-v20\n"
+         "Updated: %@\n"
+         "Target: %@:%u\n"
+         "Transport: %@\n"
+         "Status: %@\n"
+         "Applications: %lu\n"
+         "Fresh complete sizes: %lu\n"
+         "Preserved cached sizes: %lu\n"
+         "Unavailable or incomplete sizes: %lu\n"
+         "Cache: %@\n\n"
+         "Each total is StaticDiskUsage + DynamicDiskUsage. Missing fields are never replaced with guessed values.\n\n%@",
+        [NSDate date], kTargetIPAddress, gDiagnosticTargetPort,
+        gDiagnosticTransport, status ?: @"unknown",
+        (unsigned long)identifiers.count, (unsigned long)complete,
+        (unsigned long)preserved, (unsigned long)unavailable,
+        catalogPath(), details];
+    NSString *path = [MCMFilzaVirtualRoot() stringByAppendingPathComponent:
+        @"App Manager Disk Usage Diagnostics.txt"];
+    [report writeToFile:path atomically:YES
+        encoding:NSUTF8StringEncoding error:nil];
 }
 
 static NSString *loadFirstValidPairingFile(
@@ -510,11 +613,18 @@ static NSString *performRefresh(NSArray<NSURL *> *pairingCandidates,
     void *rawApps = NULL;
     size_t rawAppCount = 0;
     NSString *failure = nil;
+    NSString *diskQueryFailure = nil;
     NSURL *pairingURL = nil;
     BOOL usesLockdown = NO;
     NSDictionary *oldRecords = nil;
     NSMutableDictionary<NSString *, NSDictionary *> *newRecords =
         [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSString *> *diskStates =
+        [NSMutableDictionary dictionary];
+
+    @synchronized (catalogLock()) {
+        oldRecords = gCatalogRecords.copy ?: @{};
+    }
 
     updateStage(@"stage 1/6: reading pairing file", nil, 0, 0, 0, 0);
     failure = loadFirstValidPairingFile(pairingCandidates, &remotePairing,
@@ -571,11 +681,64 @@ static NSString *performRefresh(NSArray<NSURL *> *pairingCandidates,
         failure = consumeError(error, @"failed to connect installation_proxy");
         goto cleanup;
     }
-    error = installation_proxy_get_apps(installation, NULL, NULL, 0,
-        &rawApps, &rawAppCount);
-    if (error) {
-        failure = consumeError(error, @"failed to enumerate applications");
-        goto cleanup;
+    static const char *const requestedAttributes[] = {
+        "CFBundleIdentifier",
+        "CFBundleDisplayName",
+        "CFBundleName",
+        "CFBundleShortVersionString",
+        "CFBundleVersion",
+        "ApplicationType",
+        "StaticDiskUsage",
+        "DynamicDiskUsage"
+    };
+    plist_t browseOptions = plist_new_dict();
+    plist_t returnAttributes = plist_new_array();
+    if (browseOptions && returnAttributes) {
+        plist_dict_set_item(browseOptions, "ApplicationType",
+            plist_new_string("Any"));
+        for (size_t index = 0;
+             index < sizeof(requestedAttributes) /
+                 sizeof(requestedAttributes[0]); index++) {
+            plist_array_append_item(returnAttributes,
+                plist_new_string(requestedAttributes[index]));
+        }
+        plist_dict_set_item(browseOptions, "ReturnAttributes",
+            returnAttributes);
+        returnAttributes = NULL; // owned by browseOptions
+        error = installation_proxy_browse(installation, browseOptions,
+            (plist_t **)&rawApps, &rawAppCount);
+    } else {
+        error = NULL;
+        diskQueryFailure = @"failed to allocate installation_proxy Browse options";
+    }
+    if (returnAttributes) plist_free(returnAttributes);
+    if (browseOptions) plist_free(browseOptions);
+
+    if (error || diskQueryFailure.length > 0 || rawAppCount == 0) {
+        if (error) {
+            diskQueryFailure = consumeError(error,
+                @"disk-usage Browse query failed");
+        } else if (diskQueryFailure.length == 0) {
+            diskQueryFailure = @"disk-usage Browse query returned no applications";
+        }
+        if (rawApps) {
+            plist_t *appsToFree = (plist_t *)rawApps;
+            for (size_t index = 0; index < rawAppCount; index++)
+                plist_free(appsToFree[index]);
+            idevice_data_free((uint8_t *)rawApps,
+                rawAppCount * sizeof(plist_t));
+        }
+        rawApps = NULL;
+        rawAppCount = 0;
+        error = installation_proxy_get_apps(installation, NULL, NULL, 0,
+            &rawApps, &rawAppCount);
+        if (error) {
+            NSString *fallbackFailure = consumeError(error,
+                @"fallback application enumeration failed");
+            failure = [NSString stringWithFormat:@"%@; %@",
+                diskQueryFailure, fallbackFailure];
+            goto cleanup;
+        }
     }
 
     plist_t *apps = (plist_t *)rawApps;
@@ -590,7 +753,46 @@ static NSString *performRefresh(NSArray<NSURL *> *pairingCandidates,
         goto cleanup;
     }
 
-    @synchronized (catalogLock()) { oldRecords = gCatalogRecords.copy; }
+    for (NSString *identifier in newRecords.allKeys.copy) {
+        NSDictionary *freshRecord = newRecords[identifier];
+        NSDictionary *oldRecord = [oldRecords[identifier]
+            isKindOfClass:NSDictionary.class] ? oldRecords[identifier] : @{};
+        BOOL hasFreshStatic = [freshRecord[@"StaticDiskUsage"]
+            isKindOfClass:NSNumber.class];
+        BOOL hasFreshDynamic = [freshRecord[@"DynamicDiskUsage"]
+            isKindOfClass:NSNumber.class];
+        NSMutableDictionary *mergedRecord = freshRecord.mutableCopy;
+        BOOL preservedStatic = NO, preservedDynamic = NO;
+        if (!hasFreshStatic && [oldRecord[@"StaticDiskUsage"]
+                isKindOfClass:NSNumber.class]) {
+            mergedRecord[@"StaticDiskUsage"] = oldRecord[@"StaticDiskUsage"];
+            preservedStatic = YES;
+        }
+        if (!hasFreshDynamic && [oldRecord[@"DynamicDiskUsage"]
+                isKindOfClass:NSNumber.class]) {
+            mergedRecord[@"DynamicDiskUsage"] = oldRecord[@"DynamicDiskUsage"];
+            preservedDynamic = YES;
+        }
+        newRecords[identifier] = mergedRecord.copy;
+
+        BOOL hasCompleteSize = [mergedRecord[@"StaticDiskUsage"]
+                isKindOfClass:NSNumber.class] &&
+            [mergedRecord[@"DynamicDiskUsage"] isKindOfClass:NSNumber.class];
+        if (hasFreshStatic && hasFreshDynamic) {
+            diskStates[identifier] = @"fresh";
+        } else if (hasCompleteSize && (preservedStatic || preservedDynamic)) {
+            diskStates[identifier] = @"preserved missing response field(s)";
+        } else {
+            NSMutableArray<NSString *> *missing = [NSMutableArray array];
+            if (![mergedRecord[@"StaticDiskUsage"] isKindOfClass:NSNumber.class])
+                [missing addObject:@"StaticDiskUsage"];
+            if (![mergedRecord[@"DynamicDiskUsage"] isKindOfClass:NSNumber.class])
+                [missing addObject:@"DynamicDiskUsage"];
+            diskStates[identifier] = [NSString stringWithFormat:
+                @"unavailable missing %@", [missing componentsJoinedByString:@","]];
+        }
+    }
+
     *recordCount = newRecords.count;
     *catalogChanged = ![oldRecords isEqualToDictionary:newRecords];
     if (*catalogChanged) {
@@ -618,6 +820,12 @@ static NSString *performRefresh(NSArray<NSURL *> *pairingCandidates,
             (unsigned long)newRecords.count], pairingURL, newRecords.count,
             0, 0, 0);
     }
+
+    writeDiskUsageDiagnostics(diskQueryFailure.length > 0
+        ? [@"catalogue fallback succeeded; disk query failed: "
+            stringByAppendingString:diskQueryFailure]
+        : @"complete: installation_proxy application and disk-usage query",
+        newRecords, diskStates);
 
     BOOL needsIconRefresh = NO;
     for (NSString *identifier in newRecords) {
@@ -700,6 +908,11 @@ static NSString *performRefresh(NSArray<NSURL *> *pairingCandidates,
     }
 
 cleanup:
+    if (failure.length > 0) {
+        writeDiskUsageDiagnostics(
+            [@"failed; preserved previous cache: " stringByAppendingString:
+                failure], oldRecords ?: @{}, nil);
+    }
     if (springBoard) springboard_services_free(springBoard);
     if (rawApps) {
         plist_t *appsToFree = (plist_t *)rawApps;

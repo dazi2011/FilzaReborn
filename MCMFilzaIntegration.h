@@ -7,6 +7,8 @@ FOUNDATION_EXPORT NSString *_Nullable MCMFilzaDataContainerPath(
     NSString *identifier, NSString * _Nullable * _Nullable error);
 FOUNDATION_EXPORT BOOL MCMFilzaEnsureAppDataLink(
     NSString *identifier, NSString * _Nullable * _Nullable error);
+FOUNDATION_EXPORT BOOL MCMFilzaRemoveAppDataLink(
+    NSString *identifier, NSString * _Nullable * _Nullable error);
 FOUNDATION_EXPORT NSArray<NSString *> *MCMFilzaAppDataIdentifiers(void);
 FOUNDATION_EXPORT NSString *_Nullable MCMFilzaAppDataPath(NSString *identifier);
 FOUNDATION_EXPORT NSString *MCMFilzaVirtualRoot(void);

@@ -17,6 +17,12 @@ FOUNDATION_EXPORT NSString * _Nullable MHADeviceCatalogVersion(
     NSString *bundleIdentifier);
 FOUNDATION_EXPORT NSString * _Nullable MHADeviceCatalogApplicationType(
     NSString *bundleIdentifier);
+FOUNDATION_EXPORT NSNumber * _Nullable MHADeviceCatalogStaticDiskUsage(
+    NSString *bundleIdentifier);
+FOUNDATION_EXPORT NSNumber * _Nullable MHADeviceCatalogDynamicDiskUsage(
+    NSString *bundleIdentifier);
+FOUNDATION_EXPORT NSNumber * _Nullable MHADeviceCatalogTotalDiskUsage(
+    NSString *bundleIdentifier);
 FOUNDATION_EXPORT NSString * _Nullable MHADeviceCatalogIconPath(
     NSString *bundleIdentifier);
 FOUNDATION_EXPORT NSString *MHADeviceCatalogStatus(void);

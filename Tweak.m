@@ -375,6 +375,14 @@ static id hook_unZipFilePassword(id self, SEL _cmd, id zipPath, id toPath, id cu
     }
     return self;
 }
+- (BOOL)respondsToSelector:(SEL)selector {
+    return [super respondsToSelector:selector] ||
+        [self.backingProxy respondsToSelector:selector];
+}
+- (id)forwardingTargetForSelector:(SEL)selector {
+    return [self.backingProxy respondsToSelector:selector]
+        ? self.backingProxy : [super forwardingTargetForSelector:selector];
+}
 - (NSString *)applicationIdentifier { return self.identifier; }
 - (NSString *)bundleIdentifier { return self.identifier; }
 - (NSString *)localizedName {
@@ -434,14 +442,10 @@ static id hook_unZipFilePassword(id self, SEL _cmd, id zipPath, id toPath, id cu
     return [self.identifier hasPrefix:@"com.apple."] ? @"System" : @"User";
 }
 - (NSNumber *)staticDiskUsage {
-    NSNumber *value = [self.backingProxy respondsToSelector:_cmd]
-        ? ((id(*)(id, SEL))objc_msgSend)(self.backingProxy, _cmd) : nil;
-    return value ?: @0;
+    return MHADeviceCatalogStaticDiskUsage(self.identifier) ?: @0;
 }
 - (NSNumber *)dynamicDiskUsage {
-    NSNumber *value = [self.backingProxy respondsToSelector:_cmd]
-        ? ((id(*)(id, SEL))objc_msgSend)(self.backingProxy, _cmd) : nil;
-    return value ?: @0;
+    return MHADeviceCatalogDynamicDiskUsage(self.identifier) ?: @0;
 }
 @end
 
@@ -529,7 +533,7 @@ static void writeMobileInstallationMetadataDiagnostics(void) {
     }
     NSMutableString *report = [NSMutableString stringWithFormat:
         @"App Manager metadata provider diagnostics\n\n"
-         "Build marker: AppManager-SearchSync-v12\n"
+         "Build marker: AppManager-CachedDiskUsage-NoFreeze-v20\n"
          "MobileInstallation status: %@\n"
          "MobileInstallation records: %lu\n"
          "MobileInstallation error: %@\n",
@@ -686,12 +690,12 @@ static void writeAppManagerDiagnostics(NSUInteger originalCount,
                                        NSUInteger finalCount) {
     NSString *report = [NSString stringWithFormat:
         @"App Manager diagnostics\n\n"
-         "Build marker: AppManager-SearchSync-v12\n"
+         "Build marker: AppManager-CachedDiskUsage-NoFreeze-v20\n"
          "Source policy: cached RSD installation_proxy identifiers are authoritative when available; successful MHA-MCM class-2 identifiers are the offline fallback and data-path provider.\n"
          "Names and versions: cached RSD installation_proxy records, then safe zero-argument LaunchServices fields.\n"
          "Icons: persistent PNG cache populated by RSD SpringBoardServices.\n"
          "Bundle identifiers: displayed independently in each row's detail label.\n"
-         "Disk usage: disabled because the jailed LS getters can block indefinitely.\n"
+         "Disk usage: cached installation_proxy StaticDiskUsage + DynamicDiskUsage; Filza's blocking native size worker and jailed LaunchServices disk-usage getters are not called.\n"
          "No application bundle directory or .app/Info.plist was scanned.\n\n"
          "RSD catalogue status: %@\n"
          "RSD cached identifiers: %lu\n"
@@ -810,20 +814,40 @@ static IMP orig_appItemFileName = NULL;
 static void hook_setAppProxy(id self, SEL _cmd, id proxy) {
     if (!proxy) return;
 
-    // The original setter scans bundleURL for icon files. Store the proxy ivar
-    // directly and populate only the fields used by Filza's Apps Manager.
-    Ivar proxyIvar = class_getInstanceVariable(object_getClass(self), "_appProxy");
-    if (!proxyIvar) proxyIvar = class_getInstanceVariable([self class], "_appProxy");
-    if (proxyIvar) object_setIvar(self, proxyIvar, proxy);
-    if ([self respondsToSelector:NSSelectorFromString(@"setFileSize:")])
-        ((void(*)(id, SEL, unsigned long long))objc_msgSend)(self,
-            NSSelectorFromString(@"setFileSize:"), 0);
-
     NSString *bundleId = [proxy respondsToSelector:@selector(applicationIdentifier)]
         ? ((id(*)(id, SEL))objc_msgSend)(proxy, @selector(applicationIdentifier)) : nil;
     if (![bundleId isKindOfClass:NSString.class] || bundleId.length == 0)
         bundleId = [self respondsToSelector:NSSelectorFromString(@"bundleId")]
             ? ((id(*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"bundleId")) : nil;
+
+    // The original setter scans bundleURL for icon files. Keep that path
+    // bypassed, but wrap the proxy so Filza's own size worker and detail view
+    // read only the installation_proxy cache instead of blocking LS getters.
+    id safeProxy = proxy;
+    if (bundleId.length > 0 &&
+        ![proxy isKindOfClass:MHAAppManagerProxy.class])
+        safeProxy = [[MHAAppManagerProxy alloc]
+            initWithIdentifier:bundleId backingProxy:proxy];
+    Ivar proxyIvar = class_getInstanceVariable(object_getClass(self), "_appProxy");
+    if (!proxyIvar) proxyIvar = class_getInstanceVariable([self class], "_appProxy");
+    if (proxyIvar) object_setIvar(self, proxyIvar, safeProxy);
+    proxy = safeProxy;
+
+    NSNumber *totalDiskUsage = bundleId.length > 0
+        ? MHADeviceCatalogTotalDiskUsage(bundleId) : nil;
+    if ([self respondsToSelector:NSSelectorFromString(@"setFileSize:")])
+        ((void(*)(id, SEL, unsigned long long))objc_msgSend)(self,
+            NSSelectorFromString(@"setFileSize:"),
+            totalDiskUsage ? totalDiskUsage.unsignedLongLongValue : 0);
+    if (totalDiskUsage && [self respondsToSelector:
+            NSSelectorFromString(@"setAFileSizeString:")]) {
+        NSString *formattedSize = [NSByteCountFormatter
+            stringFromByteCount:totalDiskUsage.longLongValue
+            countStyle:NSByteCountFormatterCountStyleFile];
+        ((void(*)(id, SEL, id))objc_msgSend)(self,
+            NSSelectorFromString(@"setAFileSizeString:"), formattedSize);
+    }
+
     if (bundleId.length == 0) return;
     if ([self respondsToSelector:NSSelectorFromString(@"setBundleId:")])
         ((void(*)(id, SEL, id))objc_msgSend)(self,
@@ -935,34 +959,97 @@ static void scheduleVisibleAppManagerCatalogueReload(void) {
     });
 }
 
+static dispatch_queue_t appManagerC2SyncQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("local.research.mha.appdata-sync",
+            DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static void writeAppDataSyncDiagnostics(NSUInteger catalogCount,
+                                        NSUInteger existingCount,
+                                        NSArray<NSString *> *added,
+                                        NSArray<NSString *> *removed,
+                                        NSArray<NSString *> *failures,
+                                        NSUInteger finalCount) {
+    NSMutableString *report = [NSMutableString stringWithFormat:
+        @"App Manager AppData sync diagnostics\n\n"
+         "Build marker: AppManager-CachedDiskUsage-NoFreeze-v20\n"
+         "Updated: %@\n"
+         "Catalogue identifiers: %lu\n"
+         "Existing generated links before sync: %lu\n"
+         "Links added or repaired: %lu\n"
+         "Stale links removed: %lu\n"
+         "Unavailable or failed lookups: %lu\n"
+         "Generated links after sync: %lu\n\n",
+        [NSDate date], (unsigned long)catalogCount,
+        (unsigned long)existingCount, (unsigned long)added.count,
+        (unsigned long)removed.count, (unsigned long)failures.count,
+        (unsigned long)finalCount];
+    for (NSString *identifier in added)
+        [report appendFormat:@"ADDED\t%@\n", identifier];
+    for (NSString *identifier in removed)
+        [report appendFormat:@"REMOVED\t%@\n", identifier];
+    for (NSString *failure in failures)
+        [report appendFormat:@"FAILED\t%@\n", failure];
+    NSString *path = [MCMFilzaVirtualRoot() stringByAppendingPathComponent:
+        @"App Manager AppData Sync Diagnostics.txt"];
+    [report writeToFile:path atomically:YES
+        encoding:NSUTF8StringEncoding error:nil];
+}
+
 static void scheduleCatalogC2Sync(void) {
     NSArray<NSString *> *identifiers = MHADeviceCatalogIdentifiers();
     if (identifiers.count == 0) return;
 
-    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
-    for (NSString *identifier in identifiers) {
-        if (![(MHADeviceCatalogApplicationType(identifier) ?: @"")
-                isEqualToString:@"User"] ||
-            MCMFilzaAppDataPath(identifier).length > 0)
-            continue;
-        [candidates addObject:identifier];
-    }
-    if (candidates.count == 0) return;
+    dispatch_async(appManagerC2SyncQueue(), ^{
+        NSSet<NSString *> *validIdentifiers = [NSSet setWithArray:identifiers];
+        NSArray<NSString *> *existingIdentifiers =
+            MCMFilzaAppDataIdentifiers();
+        NSMutableArray<NSString *> *added = [NSMutableArray array];
+        NSMutableArray<NSString *> *removed = [NSMutableArray array];
+        NSMutableArray<NSString *> *failures = [NSMutableArray array];
 
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSUInteger linked = 0;
-        for (NSString *identifier in candidates) {
+        for (NSString *identifier in existingIdentifiers) {
+            if ([validIdentifiers containsObject:identifier] ||
+                MCMFilzaAppDataPath(identifier).length > 0)
+                continue;
             NSString *error = nil;
-            if (MCMFilzaEnsureAppDataLink(identifier, &error)) {
-                linked++;
+            if (MCMFilzaRemoveAppDataLink(identifier, &error)) {
+                [removed addObject:identifier];
             } else {
-                NSLog(@"[MHA-APPMGR] no class-2 data container id=%@ detail=%@",
-                    identifier, error ?: @"unknown");
+                [failures addObject:[NSString stringWithFormat:
+                    @"remove %@: %@", identifier, error ?: @"unknown"]];
             }
         }
-        NSLog(@"[MHA-APPMGR] RSD-to-C2 sync attempted=%lu linked=%lu",
-            (unsigned long)candidates.count, (unsigned long)linked);
-        if (linked > 0) scheduleVisibleAppManagerCatalogueReload();
+
+        for (NSString *identifier in identifiers) {
+            if (![(MHADeviceCatalogApplicationType(identifier) ?: @"")
+                    isEqualToString:@"User"] ||
+                MCMFilzaAppDataPath(identifier).length > 0)
+                continue;
+            NSString *error = nil;
+            if (MCMFilzaEnsureAppDataLink(identifier, &error)) {
+                [added addObject:identifier];
+            } else {
+                [failures addObject:[NSString stringWithFormat:
+                    @"lookup %@: %@", identifier, error ?: @"unknown"]];
+            }
+        }
+
+        NSUInteger finalCount = MCMFilzaAppDataIdentifiers().count;
+        writeAppDataSyncDiagnostics(identifiers.count,
+            existingIdentifiers.count, added, removed, failures, finalCount);
+        NSLog(@"[MHA-APPMGR] RSD-to-C2 sync catalog=%lu before=%lu added=%lu removed=%lu failed=%lu after=%lu",
+            (unsigned long)identifiers.count,
+            (unsigned long)existingIdentifiers.count,
+            (unsigned long)added.count, (unsigned long)removed.count,
+            (unsigned long)failures.count, (unsigned long)finalCount);
+        if (added.count > 0 || removed.count > 0)
+            scheduleVisibleAppManagerCatalogueReload();
     });
 }
 
@@ -976,11 +1063,14 @@ static id hook_appItemIconPath(id self, SEL _cmd) {
     return nil;
 }
 
-// LS disk-usage getters can wait indefinitely for data unavailable to this
-// jailed caller. Filza's cancellation path then spins until that worker exits,
-// freezing the application. App Manager remains useful without live sizes.
+// Filza's native loadAppSize cancellation path waits synchronously for its
+// worker. On this jailed build that worker can still block even when the
+// ApplicationItem proxy exposes cached size getters, freezing the main thread
+// when App Manager opens. hook_setAppProxy already writes the cached total to
+// fileSize/aFileSizeString, so the native worker is unnecessary for display or
+// sorting and both entry points must remain non-blocking.
 static void hook_loadAppSize(id self, SEL _cmd) {
-    NSLog(@"[MHA-APPMGR] skipped entitlement-limited LS disk-usage worker");
+    NSLog(@"[MHA-APPMGR] using cached installation_proxy disk sizes; skipped native size worker");
 }
 
 static void hook_cancelAppSizeCalcSync(id self, SEL _cmd) {}
@@ -1064,7 +1154,7 @@ static void applyAppManagerCellMetadata(id browser, id cell, id indexPath) {
         NSString *rsdIconPath = MHADeviceCatalogIconPath(bundleId);
         NSString *report = [NSString stringWithFormat:
             @"App Manager row diagnostics\n\n"
-             "Build marker: AppManager-SearchSync-v12\n"
+             "Build marker: AppManager-CachedDiskUsage-NoFreeze-v20\n"
              "browser class: %@\nitem class: %@\ncell class: %@\n"
              "bundleId: %@\naFileName: %@\nfileName: %@\n"
              "documentPath: %@\nRSD cached name: %@\n"
@@ -1097,13 +1187,39 @@ static id hook_appCollectionCell(id self, SEL _cmd, id collectionView,
     id cell = ((id(*)(id, SEL, id, id))orig_appCollectionCell)(self, _cmd,
         collectionView, indexPath);
     applyAppManagerCellMetadata(self, cell, indexPath);
+    id iconImageView = appManagerObjectValue(cell,
+        NSSelectorFromString(@"iconImageView"));
+    if ([iconImageView respondsToSelector:@selector(setContentMode:)])
+        ((void(*)(id, SEL, UIViewContentMode))objc_msgSend)(iconImageView,
+            @selector(setContentMode:), UIViewContentModeScaleAspectFit);
+    if ([iconImageView respondsToSelector:@selector(setClipsToBounds:)])
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(iconImageView,
+            @selector(setClipsToBounds:), YES);
     return cell;
 }
 
 static char kAppManagerSearchItemsKey;
+static char kAppManagerSearchMatchesKey;
+static char kAppManagerSearchSourceBrowserKey;
+static char kAppManagerSearchSourceControllerKey;
 static IMP orig_appManagerSearchButton = NULL;
 static IMP orig_searchControllerTextDidChange = NULL;
+static IMP orig_searchControllerViewDidLoad = NULL;
+static IMP orig_searchControllerNumberOfItems = NULL;
+static IMP orig_searchControllerItemAtIndexPath = NULL;
+static IMP orig_searchControllerDidSelectItem = NULL;
 static BOOL gAppManagerSearchHooksInstalled = NO;
+
+static dispatch_queue_t appManagerSearchDiagnosticsQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create(
+            "local.research.mha.app-manager-search-diagnostics",
+            DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
 
 static NSArray *appManagerItemsSnapshot(id browser) {
     id controller = appManagerObjectValue(browser,
@@ -1147,13 +1263,13 @@ static NSArray *appManagerItemsSnapshot(id browser) {
 }
 
 static void hook_appManagerSearchButton(id self, SEL _cmd, id toolbar,
-                                        id sender) {
+                                        BOOL selected) {
     Class applicationsBrowser = NSClassFromString(@"ApplicationsBrowserView");
     Class searchClass = NSClassFromString(@"SearchController");
     if (!applicationsBrowser || ![self isKindOfClass:applicationsBrowser] ||
         !searchClass) {
-        ((void(*)(id, SEL, id, id))orig_appManagerSearchButton)(self, _cmd,
-            toolbar, sender);
+        ((void(*)(id, SEL, id, BOOL))orig_appManagerSearchButton)(self, _cmd,
+            toolbar, selected);
         return;
     }
 
@@ -1163,15 +1279,14 @@ static void hook_appManagerSearchButton(id self, SEL _cmd, id toolbar,
     NSArray *items = appManagerItemsSnapshot(self);
     objc_setAssociatedObject(searchController, &kAppManagerSearchItemsKey,
         items, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if ([searchController respondsToSelector:NSSelectorFromString(
-            @"setFoundProxiesList:")])
-        ((void(*)(id, SEL, id))objc_msgSend)(searchController,
-            NSSelectorFromString(@"setFoundProxiesList:"),
-            [NSMutableArray array]);
-    if ([searchController respondsToSelector:NSSelectorFromString(
-            @"setPageObject:")])
-        ((void(*)(id, SEL, id))objc_msgSend)(searchController,
-            NSSelectorFromString(@"setPageObject:"), controller);
+    id sourceController = appManagerObjectValue(self,
+        NSSelectorFromString(@"dataSource")) ?: controller;
+    objc_setAssociatedObject(searchController,
+        &kAppManagerSearchSourceBrowserKey, self,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(searchController,
+        &kAppManagerSearchSourceControllerKey, sourceController,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     NSString *currentPath = appManagerObjectValue(controller,
         NSSelectorFromString(@"currentPath"));
     if ([searchController respondsToSelector:NSSelectorFromString(
@@ -1184,6 +1299,33 @@ static void hook_appManagerSearchButton(id self, SEL _cmd, id toolbar,
         (unsigned long)items.count);
 }
 
+static void hook_searchControllerEditingChanged(id self, SEL _cmd,
+                                                id textField) {
+    if (!objc_getAssociatedObject(self, &kAppManagerSearchItemsKey)) return;
+    id searchBar = appManagerObjectValue(self,
+        NSSelectorFromString(@"searchBar"));
+    NSString *text = appManagerObjectValue(textField,
+        NSSelectorFromString(@"text"));
+    ((void(*)(id, SEL, id, id))objc_msgSend)(self,
+        NSSelectorFromString(@"searchBar:textDidChange:"), searchBar,
+        text ?: @"");
+}
+
+static void hook_searchControllerViewDidLoad(id self, SEL _cmd) {
+    ((void(*)(id, SEL))orig_searchControllerViewDidLoad)(self, _cmd);
+    if (!objc_getAssociatedObject(self, &kAppManagerSearchItemsKey)) return;
+
+    id searchBar = appManagerObjectValue(self,
+        NSSelectorFromString(@"searchBar"));
+    id textField = appManagerObjectValue(searchBar,
+        NSSelectorFromString(@"searchTextField"));
+    SEL action = NSSelectorFromString(@"mha_appManagerSearchEditingChanged:");
+    if ([textField respondsToSelector:@selector(addTarget:action:forControlEvents:)])
+        ((void(*)(id, SEL, id, SEL, UIControlEvents))objc_msgSend)(textField,
+            @selector(addTarget:action:forControlEvents:), self, action,
+            UIControlEventEditingChanged);
+}
+
 static void hook_searchControllerTextDidChange(id self, SEL _cmd,
                                                id searchBar, id value) {
     NSArray *items = objc_getAssociatedObject(self,
@@ -1194,9 +1336,18 @@ static void hook_searchControllerTextDidChange(id self, SEL _cmd,
         return;
     }
 
-    NSString *query = [value isKindOfClass:NSString.class]
-        ? [(NSString *)value stringByTrimmingCharactersInSet:
-            NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
+    NSString *callbackText = [value isKindOfClass:NSString.class]
+        ? value : nil;
+    NSString *barText = appManagerObjectValue(searchBar,
+        NSSelectorFromString(@"text"));
+    id searchTextField = appManagerObjectValue(searchBar,
+        NSSelectorFromString(@"searchTextField"));
+    NSString *fieldText = appManagerObjectValue(searchTextField,
+        NSSelectorFromString(@"text"));
+    NSString *effectiveText = callbackText.length > 0 ? callbackText :
+        (fieldText.length > 0 ? fieldText : (barText ?: callbackText ?: @""));
+    NSString *query = [effectiveText stringByTrimmingCharactersInSet:
+        NSCharacterSet.whitespaceAndNewlineCharacterSet];
     NSMutableArray *matches = [NSMutableArray array];
     NSStringCompareOptions options = NSCaseInsensitiveSearch |
         NSDiacriticInsensitiveSearch | NSWidthInsensitiveSearch;
@@ -1214,19 +1365,192 @@ static void hook_searchControllerTextDidChange(id self, SEL _cmd,
         }
     }
 
+    objc_setAssociatedObject(self, &kAppManagerSearchMatchesKey, matches.copy,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
     if ([self respondsToSelector:NSSelectorFromString(@"setText:")])
         ((void(*)(id, SEL, id))objc_msgSend)(self,
             NSSelectorFromString(@"setText:"), value);
-    ((void(*)(id, SEL, id))objc_msgSend)(self,
-        NSSelectorFromString(@"setFoundProxiesList:"), matches);
+    id foundProxies = appManagerObjectValue(self,
+        NSSelectorFromString(@"foundProxiesList"));
+    if ([foundProxies respondsToSelector:@selector(removeAllObjects)] &&
+        [foundProxies respondsToSelector:@selector(addObjectsFromArray:)]) {
+        ((void(*)(id, SEL))objc_msgSend)(foundProxies,
+            @selector(removeAllObjects));
+        ((void(*)(id, SEL, id))objc_msgSend)(foundProxies,
+            @selector(addObjectsFromArray:), matches);
+    } else if ([self respondsToSelector:NSSelectorFromString(
+            @"setFoundProxiesList:")]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(self,
+            NSSelectorFromString(@"setFoundProxiesList:"), matches);
+    }
     if ([self respondsToSelector:NSSelectorFromString(
             @"setIntCurrentProxyCount:")])
-        ((void(*)(id, SEL, NSInteger))objc_msgSend)(self,
-            NSSelectorFromString(@"setIntCurrentProxyCount:"), matches.count);
+        ((void(*)(id, SEL, int))objc_msgSend)(self,
+            NSSelectorFromString(@"setIntCurrentProxyCount:"),
+            (int)MIN(matches.count, (NSUInteger)INT_MAX));
+    id autocompleteList = appManagerObjectValue(self,
+        NSSelectorFromString(@"autocompleteTextListView"));
+    if ([autocompleteList respondsToSelector:@selector(setAlpha:)])
+        ((void(*)(id, SEL, CGFloat))objc_msgSend)(autocompleteList,
+            @selector(setAlpha:), query.length > 0 ? 0.0 : 1.0);
     id browser = appManagerObjectValue(self,
         NSSelectorFromString(@"browserView"));
     if ([browser respondsToSelector:@selector(reloadData)])
         ((void(*)(id, SEL))objc_msgSend)(browser, @selector(reloadData));
+
+    id pageObject = appManagerObjectValue(self,
+        NSSelectorFromString(@"pageObject"));
+    id pageFileList = appManagerObjectValue(pageObject,
+        NSSelectorFromString(@"fileList"));
+    NSUInteger proxyCount = [foundProxies respondsToSelector:@selector(count)]
+        ? ((NSUInteger(*)(id, SEL))objc_msgSend)(foundProxies,
+            @selector(count)) : 0;
+    NSUInteger pageCount = [pageFileList respondsToSelector:@selector(count)]
+        ? ((NSUInteger(*)(id, SEL))objc_msgSend)(pageFileList,
+            @selector(count)) : 0;
+    id firstMatch = matches.firstObject;
+    NSString *firstBundleId = appManagerObjectValue(firstMatch,
+        NSSelectorFromString(@"bundleId"));
+    NSString *firstName = firstMatch ? appManagerRenderedName(firstMatch) : nil;
+    CGFloat autocompleteAlpha =
+        [autocompleteList respondsToSelector:@selector(alpha)]
+            ? ((CGFloat(*)(id, SEL))objc_msgSend)(autocompleteList,
+                @selector(alpha)) : -1.0;
+    NSString *report = [NSString stringWithFormat:
+        @"App Manager search diagnostics\n\n"
+         "Build marker: AppManager-CachedDiskUsage-NoFreeze-v20\n"
+         "controller class: %@\ncallback value class: %@\n"
+         "callback text: %@\nsearch bar text: %@\n"
+         "search field text: %@\neffective query: %@\n"
+         "source items: %lu\n"
+         "matches: %lu\nfirst match class: %@\n"
+         "first match name: %@\nfirst match bundleId: %@\n"
+         "result proxy class: %@\nresult proxy count: %lu\n"
+         "browser class: %@\nbrowser dataSource class: %@\n"
+         "page class: %@\npage fileList class: %@\npage fileList count: %lu\n"
+         "autocomplete list class: %@\nautocomplete alpha: %.1f\n"
+         "search selection exits search session: enabled\n"
+         "direct SearchController data source: enabled\n",
+        NSStringFromClass([self class]),
+        value ? NSStringFromClass([value class]) : @"(nil)",
+        callbackText ?: @"(nil)", barText ?: @"(nil)",
+        fieldText ?: @"(nil)", query ?: @"(nil)",
+        (unsigned long)items.count, (unsigned long)matches.count,
+        firstMatch ? NSStringFromClass([firstMatch class]) : @"(nil)",
+        firstName ?: @"(nil)", firstBundleId ?: @"(nil)",
+        foundProxies ? NSStringFromClass([foundProxies class]) : @"(nil)",
+        (unsigned long)proxyCount,
+        browser ? NSStringFromClass([browser class]) : @"(nil)",
+        NSStringFromClass([[browser dataSource] class]) ?: @"(nil)",
+        pageObject ? NSStringFromClass([pageObject class]) : @"(nil)",
+        pageFileList ? NSStringFromClass([pageFileList class]) : @"(nil)",
+        (unsigned long)pageCount,
+        autocompleteList ? NSStringFromClass([autocompleteList class]) : @"(nil)",
+        autocompleteAlpha];
+    NSString *path = [MCMFilzaVirtualRoot() stringByAppendingPathComponent:
+        @"App Manager Search Diagnostics.txt"];
+    dispatch_async(appManagerSearchDiagnosticsQueue(), ^{
+        [report writeToFile:path atomically:YES
+            encoding:NSUTF8StringEncoding error:nil];
+    });
+}
+
+static NSInteger hook_searchControllerNumberOfItems(id self, SEL _cmd,
+                                                     id browser,
+                                                     NSInteger section) {
+    NSArray *items = objc_getAssociatedObject(self,
+        &kAppManagerSearchItemsKey);
+    if (items) {
+        NSArray *matches = objc_getAssociatedObject(self,
+            &kAppManagerSearchMatchesKey);
+        return (NSInteger)matches.count;
+    }
+    return ((NSInteger(*)(id, SEL, id, NSInteger))
+        orig_searchControllerNumberOfItems)(self, _cmd, browser, section);
+}
+
+static id hook_searchControllerItemAtIndexPath(id self, SEL _cmd,
+                                               id browser,
+                                               NSIndexPath *indexPath) {
+    NSArray *items = objc_getAssociatedObject(self,
+        &kAppManagerSearchItemsKey);
+    if (items) {
+        NSArray *matches = objc_getAssociatedObject(self,
+            &kAppManagerSearchMatchesKey);
+        NSInteger row = indexPath.row;
+        return row >= 0 && (NSUInteger)row < matches.count
+            ? matches[(NSUInteger)row] : nil;
+    }
+    return ((id(*)(id, SEL, id, id))orig_searchControllerItemAtIndexPath)(
+        self, _cmd, browser, indexPath);
+}
+
+static NSUInteger appManagerSourceIndexForItem(id controller, id targetItem) {
+    id fileList = appManagerObjectValue(controller,
+        NSSelectorFromString(@"fileList"));
+    NSUInteger count = [fileList respondsToSelector:@selector(count)]
+        ? ((NSUInteger(*)(id, SEL))objc_msgSend)(fileList, @selector(count)) : 0;
+    NSString *targetBundleId = appManagerObjectValue(targetItem,
+        NSSelectorFromString(@"bundleId"));
+    for (NSUInteger index = 0; index < count; index++) {
+        id candidate = [fileList respondsToSelector:@selector(objectAtIndex:)]
+            ? ((id(*)(id, SEL, NSUInteger))objc_msgSend)(fileList,
+                @selector(objectAtIndex:), index) : nil;
+        if (candidate == targetItem) return index;
+        NSString *candidateBundleId = appManagerObjectValue(candidate,
+            NSSelectorFromString(@"bundleId"));
+        if (targetBundleId.length > 0 &&
+            [candidateBundleId isEqualToString:targetBundleId])
+            return index;
+    }
+    return NSNotFound;
+}
+
+static void hook_searchControllerDidSelectItem(id self, SEL _cmd, id browser,
+                                               NSIndexPath *indexPath) {
+    NSArray *items = objc_getAssociatedObject(self,
+        &kAppManagerSearchItemsKey);
+    if (!items) {
+        ((void(*)(id, SEL, id, id))orig_searchControllerDidSelectItem)(
+            self, _cmd, browser, indexPath);
+        return;
+    }
+
+    NSArray *matches = objc_getAssociatedObject(self,
+        &kAppManagerSearchMatchesKey);
+    NSInteger row = indexPath.row;
+    id selectedItem = row >= 0 && (NSUInteger)row < matches.count
+        ? matches[(NSUInteger)row] : nil;
+    id sourceBrowser = objc_getAssociatedObject(self,
+        &kAppManagerSearchSourceBrowserKey);
+    id sourceController = objc_getAssociatedObject(self,
+        &kAppManagerSearchSourceControllerKey);
+    NSUInteger sourceIndex = selectedItem
+        ? appManagerSourceIndexForItem(sourceController, selectedItem)
+        : NSNotFound;
+    SEL sourceSelection = NSSelectorFromString(
+        @"browserView:didSelectItemAtIndexPath:");
+    if (!sourceBrowser || ![sourceController respondsToSelector:sourceSelection] ||
+        sourceIndex == NSNotFound) {
+        ((void(*)(id, SEL, id, id))orig_searchControllerDidSelectItem)(
+            self, _cmd, browser, indexPath);
+        return;
+    }
+
+    NSString *bundleId = appManagerObjectValue(selectedItem,
+        NSSelectorFromString(@"bundleId"));
+    NSIndexPath *sourceIndexPath = [NSIndexPath indexPathForRow:
+        (NSInteger)sourceIndex inSection:0];
+    if ([self respondsToSelector:NSSelectorFromString(@"cancelAnimated:")])
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(self,
+            NSSelectorFromString(@"cancelAnimated:"), NO);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ((void(*)(id, SEL, id, id))objc_msgSend)(sourceController,
+            sourceSelection, sourceBrowser, sourceIndexPath);
+        NSLog(@"[MHA-APPMGR] routed search result %@ into main session",
+            bundleId ?: @"(unknown)");
+    });
 }
 
 static void installAppManagerHooks(void) {
@@ -1295,16 +1619,17 @@ static void installAppManagerHooks(void) {
     if (applicationsController) {
         Method loadSize = class_getInstanceMethod(applicationsController,
             NSSelectorFromString(@"loadAppSize"));
+        Method cancelSize = class_getInstanceMethod(applicationsController,
+            NSSelectorFromString(@"cancelAppSizeCalcSync"));
         if (loadSize && method_getImplementation(loadSize) !=
                 (IMP)hook_loadAppSize)
             method_setImplementation(loadSize, (IMP)hook_loadAppSize);
-        Method cancelSize = class_getInstanceMethod(applicationsController,
-            NSSelectorFromString(@"cancelAppSizeCalcSync"));
         if (cancelSize && method_getImplementation(cancelSize) !=
                 (IMP)hook_cancelAppSizeCalcSync)
             method_setImplementation(cancelSize,
                 (IMP)hook_cancelAppSizeCalcSync);
-        gAppSizeHooksInstalled = loadSize && cancelSize &&
+        gAppSizeHooksInstalled = gAppItemSetterHookInstalled &&
+            loadSize && cancelSize &&
             method_getImplementation(loadSize) == (IMP)hook_loadAppSize &&
             method_getImplementation(cancelSize) ==
                 (IMP)hook_cancelAppSizeCalcSync;
@@ -1360,6 +1685,26 @@ static void installAppManagerHooks(void) {
     }
 
     Class searchController = NSClassFromString(@"SearchController");
+    SEL searchEditingSelector = NSSelectorFromString(
+        @"mha_appManagerSearchEditingChanged:");
+    if (searchController && !class_getInstanceMethod(searchController,
+            searchEditingSelector))
+        class_addMethod(searchController, searchEditingSelector,
+            (IMP)hook_searchControllerEditingChanged, "v@:@");
+
+    SEL searchViewDidLoadSelector = @selector(viewDidLoad);
+    Method searchViewDidLoadMethod = class_getInstanceMethod(searchController,
+        searchViewDidLoadSelector);
+    if (searchViewDidLoadMethod &&
+            method_getImplementation(searchViewDidLoadMethod) !=
+                (IMP)hook_searchControllerViewDidLoad) {
+        if (!orig_searchControllerViewDidLoad)
+            orig_searchControllerViewDidLoad =
+                method_getImplementation(searchViewDidLoadMethod);
+        method_setImplementation(searchViewDidLoadMethod,
+            (IMP)hook_searchControllerViewDidLoad);
+    }
+
     SEL searchTextSelector = NSSelectorFromString(@"searchBar:textDidChange:");
     Method searchTextMethod = class_getInstanceMethod(searchController,
         searchTextSelector);
@@ -1371,15 +1716,66 @@ static void installAppManagerHooks(void) {
         method_setImplementation(searchTextMethod,
             (IMP)hook_searchControllerTextDidChange);
     }
+
+    SEL searchCountSelector = NSSelectorFromString(
+        @"browserView:numberOfItemsInSection:");
+    Method searchCountMethod = class_getInstanceMethod(searchController,
+        searchCountSelector);
+    if (searchCountMethod && method_getImplementation(searchCountMethod) !=
+            (IMP)hook_searchControllerNumberOfItems) {
+        if (!orig_searchControllerNumberOfItems)
+            orig_searchControllerNumberOfItems =
+                method_getImplementation(searchCountMethod);
+        method_setImplementation(searchCountMethod,
+            (IMP)hook_searchControllerNumberOfItems);
+    }
+
+    SEL searchItemSelector = NSSelectorFromString(
+        @"browserView:itemForSectionAtIndexPath:");
+    Method searchItemMethod = class_getInstanceMethod(searchController,
+        searchItemSelector);
+    if (searchItemMethod && method_getImplementation(searchItemMethod) !=
+            (IMP)hook_searchControllerItemAtIndexPath) {
+        if (!orig_searchControllerItemAtIndexPath)
+            orig_searchControllerItemAtIndexPath =
+                method_getImplementation(searchItemMethod);
+        method_setImplementation(searchItemMethod,
+            (IMP)hook_searchControllerItemAtIndexPath);
+    }
+    SEL searchDidSelectSelector = NSSelectorFromString(
+        @"browserView:didSelectItemAtIndexPath:");
+    Method searchDidSelectMethod = class_getInstanceMethod(searchController,
+        searchDidSelectSelector);
+    if (searchDidSelectMethod &&
+            method_getImplementation(searchDidSelectMethod) !=
+                (IMP)hook_searchControllerDidSelectItem) {
+        if (!orig_searchControllerDidSelectItem)
+            orig_searchControllerDidSelectItem =
+                method_getImplementation(searchDidSelectMethod);
+        method_setImplementation(searchDidSelectMethod,
+            (IMP)hook_searchControllerDidSelectItem);
+    }
     gAppManagerSearchHooksInstalled = browserClass && searchController &&
-        searchTextMethod &&
+        searchViewDidLoadMethod && searchTextMethod && searchCountMethod &&
+        searchItemMethod && searchDidSelectMethod &&
         class_getMethodImplementation(browserClass,
             NSSelectorFromString(@"TopToolbarView:didSelectSearchButton:")) ==
                 (IMP)hook_appManagerSearchButton &&
+        class_getMethodImplementation(searchController,
+            searchEditingSelector) ==
+                (IMP)hook_searchControllerEditingChanged &&
+        method_getImplementation(searchViewDidLoadMethod) ==
+                (IMP)hook_searchControllerViewDidLoad &&
         method_getImplementation(searchTextMethod) ==
-                (IMP)hook_searchControllerTextDidChange;
+                (IMP)hook_searchControllerTextDidChange &&
+        method_getImplementation(searchCountMethod) ==
+                (IMP)hook_searchControllerNumberOfItems &&
+        method_getImplementation(searchItemMethod) ==
+                (IMP)hook_searchControllerItemAtIndexPath &&
+        method_getImplementation(searchDidSelectMethod) ==
+                (IMP)hook_searchControllerDidSelectItem;
 
-    NSLog(@"[MHA-APPMGR] hooks workspace=%d appItem=%d setter=%d fileName=%d iconPath=%d controller=%d sizes=%d cells=%d search=%d build=AppManager-SearchSync-v12",
+    NSLog(@"[MHA-APPMGR] hooks workspace=%d appItem=%d setter=%d fileName=%d iconPath=%d controller=%d sizes=%d cells=%d search=%d build=AppManager-CachedDiskUsage-NoFreeze-v20",
         gLSWorkspaceHookInstalled, appItem != Nil,
         gAppItemSetterHookInstalled, gAppItemFileNameHookInstalled,
         gAppItemIconHookInstalled, applicationsController != Nil,
@@ -2475,8 +2871,10 @@ static void startAppManagerCatalogueTimer(void) {
     gAppManagerCatalogueTimer = [NSTimer scheduledTimerWithTimeInterval:300.0
         repeats:YES block:^(__unused NSTimer *timer) {
             if (UIApplication.sharedApplication.applicationState ==
-                    UIApplicationStateActive)
+                    UIApplicationStateActive) {
                 MHADeviceCatalogScheduleRefresh();
+                scheduleCatalogC2Sync();
+            }
         }];
 }
 
@@ -2512,6 +2910,7 @@ __attribute__((constructor)) void TweakInit(void) {
         object:nil queue:NSOperationQueue.mainQueue
         usingBlock:^(__unused NSNotification *note) {
             MHADeviceCatalogScheduleRefresh();
+            scheduleCatalogC2Sync();
         }];
     // Populate the MCM root before Filza restores its initial browser path.
     runMCMPath();
