@@ -12,8 +12,6 @@ FOUNDATION_EXPORT BOOL MCMFilzaRemoveAppDataLink(
 FOUNDATION_EXPORT NSArray<NSString *> *MCMFilzaAppDataIdentifiers(void);
 FOUNDATION_EXPORT NSString *_Nullable MCMFilzaAppDataPath(NSString *identifier);
 FOUNDATION_EXPORT NSString *MCMFilzaVirtualRoot(void);
-FOUNDATION_EXPORT NSString *MCMFilzaArchivePath(void);
-FOUNDATION_EXPORT void MCMFilzaRecordDeletedGeneratedPath(NSString *path);
 FOUNDATION_EXPORT NSString *MCMFilzaWallpaperLabName(void);
 FOUNDATION_EXPORT BOOL MCMFilzaIsRunningInLiveContainer(void);
 FOUNDATION_EXPORT BOOL MCMFilzaPathHasActiveLease(NSString *path);
